@@ -38,6 +38,14 @@ static void post_request_notification(NSString* name, NSString* token) {
 	[[NSDistributedNotificationCenter defaultCenter] postNotificationName:name object:token userInfo:nil deliverImmediately:YES];
 }
 
+/*
+ * Since macOS 14, views don't clip their drawing to their bounds by default,
+ * and drawRect: can be asked to draw outside them.
+ */
+static void clip_to_bounds(NSView* view) {
+	if (@available(macOS 14.0, *)) view.clipsToBounds = YES;
+}
+
 static void add_subviews(NSView* parent, NSArray<NSView*>* views) {
 	for (NSView* view in views) {
 		view.translatesAutoresizingMaskIntoConstraints = NO;
@@ -193,6 +201,12 @@ static NSColor* status_color(uint8_t status) {
 
 #pragma mark - DiffView
 
+/*
+ * A DiffView lays out, for each side, a gutter of line numbers and a scroll
+ * view with that side's text, with connectors between the sides. Each side
+ * scrolls sideways on its own, and up and down together with the others.
+ */
+
 static const CGFloat kTopPadding = 4;
 static const CGFloat kMiddleWidth = 40;
 static const CGFloat kGutterPadding = 8;
@@ -218,24 +232,58 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	return a < b ? a : b;
 }
 
-@implementation DiffView {
-	NSFont* _font;
-	/* Core Text attributes, so drawing and hit testing share one layout. */
-	NSDictionary* _textAttributes;
-	NSDictionary* _numberAttributes;
-	NSDictionary* _currentNumberAttributes;
-	CGFloat _lineHeight;
-	CGFloat _fontLineHeight;
-	CGFloat _textInset;
-	CGFloat _charWidth;
-	CGFloat _gutterWidth;
-	uint32_t _maxColumns;
-	size_t _maxLines;
+@class DiffPaneView;
 
-	/* The selection is within one side: from _anchor, where it started, to _head. */
-	NSInteger _selectionSide;
-	TextPosition _anchor;
-	TextPosition _head;
+/* What the parts of a DiffView share. */
+@interface DiffView ()
+	@property (nonatomic, readonly) NSFont* font;
+	/* Core Text attributes, so drawing and hit testing share one layout. */
+	@property (nonatomic, readonly) NSDictionary* textAttributes;
+	@property (nonatomic, readonly) NSDictionary* numberAttributes;
+	@property (nonatomic, readonly) NSDictionary* currentNumberAttributes;
+	@property (nonatomic, readonly) CGFloat lineHeight;
+	@property (nonatomic, readonly) CGFloat fontLineHeight;
+	@property (nonatomic, readonly) CGFloat textInset;
+	@property (nonatomic, readonly) CGFloat charWidth;
+	@property (nonatomic, readonly) CGFloat gutterWidth;
+	- (CGFloat) rowY:(size_t)row;
+	/* The rows from first up to last that overlap document coordinates top to bottom. */
+	- (void) rowsFrom:(CGFloat)top to:(CGFloat)bottom first:(size_t*)first last:(size_t*)last;
+	/* How far a side is scrolled down. */
+	- (CGFloat) verticalOffset:(NSUInteger)side;
+	- (BOOL) rowInCurrentHunk:(size_t)row;
+	/* Outline the hunks in dirty, drawn offset up, with bands filling them if bands is set. */
+	- (void) drawHunksInRect:(NSRect)dirty offset:(CGFloat)offset bands:(BOOL)bands;
+	- (void) selectHunkAtRow:(size_t)row;
+	- (void) paneDidSelect:(DiffPaneView*)pane;
+@end
+
+/* One side's text, in its own scroll view. */
+@interface DiffPaneView : NSView
+	@property (nonatomic, readonly) NSUInteger side;
+	- (instancetype) initWithOwner:(DiffView*)owner side:(NSUInteger)side;
+	- (void) diffDidChange;
+	- (void) relayout;
+	- (void) clearSelection;
+@end
+
+/* One side's line numbers, which stay put when the side scrolls sideways. */
+@interface DiffGutterView : NSView
+	- (instancetype) initWithOwner:(DiffView*)owner side:(NSUInteger)side;
+@end
+
+/* The gap after a side, joining its hunks to the next side's. */
+@interface DiffConnectorView : NSView
+	- (instancetype) initWithOwner:(DiffView*)owner side:(NSUInteger)side;
+@end
+
+@implementation DiffView {
+	NSArray<NSScrollView*>* _scrolls;
+	NSArray<DiffPaneView*>* _panes;
+	NSArray<DiffGutterView*>* _gutters;
+	NSArray<DiffConnectorView*>* _connectors;
+	size_t _maxLines;
+	BOOL _syncingScroll;
 }
 
 + (void) initialize {
@@ -244,8 +292,44 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 
 - (instancetype) initWithFrame:(NSRect)frame {
 	if ((self = [super initWithFrame:frame])) {
+		clip_to_bounds(self);
 		_currentHunk = -1;
-		_selectionSide = -1;
+		NSMutableArray* scrolls = [NSMutableArray array];
+		NSMutableArray* panes = [NSMutableArray array];
+		NSMutableArray* gutters = [NSMutableArray array];
+		NSMutableArray* connectors = [NSMutableArray array];
+		for (NSUInteger side = 0; side < kSideCount; side++) {
+			DiffPaneView* pane = [[DiffPaneView alloc] initWithOwner:self side:side];
+			NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+			/* One vertical scroller, at the far right, for all the sides. */
+			scroll.hasVerticalScroller = side + 1 == kSideCount;
+			scroll.hasHorizontalScroller = YES;
+			scroll.autohidesScrollers = YES;
+			scroll.backgroundColor = [NSColor textBackgroundColor];
+			scroll.documentView = pane;
+			scroll.contentView.postsBoundsChangedNotifications = YES;
+			[[NSNotificationCenter defaultCenter]
+				addObserver:self
+				selector:@selector(clipViewBoundsDidChange:)
+				name:NSViewBoundsDidChangeNotification
+				object:scroll.contentView];
+
+			DiffGutterView* gutter = [[DiffGutterView alloc] initWithOwner:self side:side];
+			[self addSubview:gutter];
+			[self addSubview:scroll];
+			[scrolls addObject:scroll];
+			[panes addObject:pane];
+			[gutters addObject:gutter];
+			if (side + 1 < kSideCount) {
+				DiffConnectorView* connector = [[DiffConnectorView alloc] initWithOwner:self side:side];
+				[self addSubview:connector];
+				[connectors addObject:connector];
+			}
+		}
+		_scrolls = scrolls;
+		_panes = panes;
+		_gutters = gutters;
+		_connectors = connectors;
 		self.fontSize = 12;
 	}
 	return self;
@@ -253,6 +337,300 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 
 - (void) dealloc {
 	dt_file_diff_free(_diff);
+}
+
+- (BOOL) isFlipped { return YES; }
+
+- (void) setFrameSize:(NSSize)size {
+	[super setFrameSize:size];
+	[self layoutSides];
+}
+
+- (void) layout {
+	[super layout];
+	[self layoutSides];
+}
+
+/* Each side gets an equal share of the width, after the connectors between them. */
+- (void) layoutSides {
+	NSRect bounds = self.bounds;
+	CGFloat share = floor((NSWidth(bounds) - (CGFloat)(kSideCount - 1) * kMiddleWidth) / (CGFloat)kSideCount);
+	CGFloat x = 0;
+	for (NSUInteger side = 0; side < kSideCount; side++) {
+		CGFloat width = side + 1 == kSideCount ? NSWidth(bounds) - x : share;
+		CGFloat gutter = fmin(_gutterWidth, width);
+		_gutters[side].frame = NSMakeRect(x, 0, gutter, NSHeight(bounds));
+		_scrolls[side].frame = NSMakeRect(x + gutter, 0, width - gutter, NSHeight(bounds));
+		x += width;
+		if (side < _connectors.count) {
+			_connectors[side].frame = NSMakeRect(x, 0, kMiddleWidth, NSHeight(bounds));
+			x += kMiddleWidth;
+		}
+	}
+}
+
+- (void) redrawAll {
+	for (NSView* view in _panes) [view setNeedsDisplay:YES];
+	for (NSView* view in _gutters) [view setNeedsDisplay:YES];
+	for (NSView* view in _connectors) [view setNeedsDisplay:YES];
+}
+
+- (void) setDiff:(DtFileDiff*)diff {
+	if (diff == _diff) return;
+	dt_file_diff_free(_diff);
+	_diff = diff;
+	_currentHunk = diff && dt_file_diff_hunk_count(diff) > 0 ? 0 : -1;
+	_maxLines = 0;
+	for (NSUInteger side = 0; diff && side < kSideCount; side++) {
+		size_t count = dt_file_diff_line_count(diff, (uint8_t)side);
+		if (count > _maxLines) _maxLines = count;
+	}
+	[self updateGutterWidth];
+	for (DiffPaneView* pane in _panes) [pane diffDidChange];
+	[self redrawAll];
+}
+
+- (void) setFontSize:(CGFloat)fontSize {
+	_fontSize = fontSize;
+	_font = [NSFont monospacedSystemFontOfSize:fontSize weight:NSFontWeightRegular];
+	NSLayoutManager* layoutManager = [[NSLayoutManager alloc] init];
+	_fontLineHeight = [layoutManager defaultLineHeightForFont:_font];
+	_lineHeight = ceil(_fontLineHeight * 1.3);
+	_textInset = floor((_lineHeight - _fontLineHeight) / 2);
+	_charWidth = [@"0" sizeWithAttributes:@{NSFontAttributeName: _font}].width;
+
+	NSArray* tabStops = @[];
+	CFArrayRef tabStopsRef = (__bridge CFArrayRef)tabStops;
+	CGFloat tabInterval = _charWidth * kTabWidth;
+	CTParagraphStyleSetting settings[] = {
+		{kCTParagraphStyleSpecifierTabStops, sizeof tabStopsRef, &tabStopsRef},
+		{kCTParagraphStyleSpecifierDefaultTabInterval, sizeof tabInterval, &tabInterval},
+	};
+	id paragraph = CFBridgingRelease(CTParagraphStyleCreate(settings, sizeof settings / sizeof settings[0]));
+	_textAttributes = @{
+		(__bridge NSString*)kCTFontAttributeName: _font,
+		(__bridge NSString*)kCTParagraphStyleAttributeName: paragraph,
+		(__bridge NSString*)kCTForegroundColorFromContextAttributeName: @YES
+	};
+	NSFont* numberFont = [NSFont monospacedDigitSystemFontOfSize:fontSize weight:NSFontWeightRegular];
+	_numberAttributes = @{
+		NSFontAttributeName: numberFont,
+		NSForegroundColorAttributeName: [NSColor secondaryLabelColor]
+	};
+	_currentNumberAttributes = @{
+		NSFontAttributeName: numberFont,
+		NSForegroundColorAttributeName: [NSColor whiteColor]
+	};
+
+	[self updateGutterWidth];
+	for (DiffPaneView* pane in _panes) [pane relayout];
+	[self redrawAll];
+}
+
+- (void) updateGutterWidth {
+	int digits = 3;
+	for (size_t n = _maxLines; n >= 1000; n /= 10) digits++;
+	CGFloat digitWidth = [@"0" sizeWithAttributes:_numberAttributes].width;
+	_gutterWidth = ceil(digits * digitWidth + 2 * kGutterPadding);
+	[self layoutSides];
+}
+
+- (void) setCurrentHunk:(NSInteger)currentHunk {
+	_currentHunk = currentHunk;
+	[self redrawAll];
+}
+
+- (CGFloat) rowY:(size_t)row {
+	return kTopPadding + (CGFloat)row * _lineHeight;
+}
+
+- (void) rowsFrom:(CGFloat)top to:(CGFloat)bottom first:(size_t*)first last:(size_t*)last {
+	size_t rowCount = _diff ? dt_file_diff_row_count(_diff) : 0;
+	*first = top > kTopPadding ? (size_t)floor((top - kTopPadding) / _lineHeight) : 0;
+	*last = (size_t)fmax(0, ceil((bottom - kTopPadding) / _lineHeight));
+	if (*last > rowCount) *last = rowCount;
+}
+
+- (CGFloat) verticalOffset:(NSUInteger)side {
+	return _scrolls[side].contentView.bounds.origin.y;
+}
+
+- (BOOL) rowInCurrentHunk:(size_t)row {
+	if (!_diff || _currentHunk < 0 || (size_t)_currentHunk >= dt_file_diff_hunk_count(_diff)) return NO;
+	DtHunk hunk = dt_file_diff_hunk(_diff, (size_t)_currentHunk);
+	return row >= hunk.row_start && row < hunk.row_end;
+}
+
+- (void) drawHunksInRect:(NSRect)dirty offset:(CGFloat)offset bands:(BOOL)bands {
+	if (!_diff) return;
+	size_t count = dt_file_diff_hunk_count(_diff);
+	for (size_t i = 0; i < count; i++) {
+		DtHunk hunk = dt_file_diff_hunk(_diff, i);
+		CGFloat top = [self rowY:hunk.row_start] - offset;
+		CGFloat bottom = [self rowY:hunk.row_end] - offset;
+		if (bottom < NSMinY(dirty) - 1 || top > NSMaxY(dirty) + 1) continue;
+		uint8_t kind = hunk_kind(hunk);
+		if (bands) {
+			[g_line_colors[kind] setFill];
+			NSRectFill(NSMakeRect(NSMinX(dirty), top, NSWidth(dirty), bottom - top));
+		}
+		[g_edge_colors[kind] setFill];
+		NSRectFill(NSMakeRect(NSMinX(dirty), top, NSWidth(dirty), 1));
+		NSRectFill(NSMakeRect(NSMinX(dirty), bottom - 1, NSWidth(dirty), 1));
+	}
+}
+
+/* Scroll every side up and down with whichever one scrolled. */
+- (void) clipViewBoundsDidChange:(NSNotification*)notification {
+	NSClipView* source = notification.object;
+	if (!_syncingScroll) {
+		_syncingScroll = YES;
+		CGFloat y = source.bounds.origin.y;
+		for (NSScrollView* scroll in _scrolls) {
+			NSClipView* clip = scroll.contentView;
+			if (clip == source || fabs(clip.bounds.origin.y - y) < 0.5) continue;
+			[clip setBoundsOrigin:NSMakePoint(clip.bounds.origin.x, y)];
+			[scroll reflectScrolledClipView:clip];
+		}
+		_syncingScroll = NO;
+	}
+	for (NSView* view in _gutters) [view setNeedsDisplay:YES];
+	for (NSView* view in _connectors) [view setNeedsDisplay:YES];
+}
+
+- (void) selectHunkAtRow:(size_t)row {
+	size_t count = _diff ? dt_file_diff_hunk_count(_diff) : 0;
+	for (size_t i = 0; i < count; i++) {
+		DtHunk hunk = dt_file_diff_hunk(_diff, i);
+		if (row >= hunk.row_start && row < hunk.row_end) {
+			self.currentHunk = (NSInteger)i;
+			if (_currentHunkChanged) _currentHunkChanged();
+			return;
+		}
+	}
+}
+
+/* Only one side has a selection at a time. */
+- (void) paneDidSelect:(DiffPaneView*)selected {
+	for (DiffPaneView* pane in _panes) {
+		if (pane != selected) [pane clearSelection];
+	}
+}
+
+/* Scroll the current hunk to a third of the way down, unless it's already in view. */
+- (void) scrollToCurrentHunk {
+	if (!_diff || _currentHunk < 0 || (size_t)_currentHunk >= dt_file_diff_hunk_count(_diff)) return;
+	DtHunk hunk = dt_file_diff_hunk(_diff, (size_t)_currentHunk);
+	CGFloat top = [self rowY:hunk.row_start];
+	CGFloat bottom = [self rowY:hunk.row_end];
+	DiffPaneView* pane = _panes[0];
+	NSRect visible = pane.visibleRect;
+	if (top >= NSMinY(visible) && bottom <= NSMaxY(visible)) return;
+	CGFloat y = fmax(0, top - floor(NSHeight(visible) / 3));
+	[pane scrollPoint:NSMakePoint(NSMinX(visible), y)];
+}
+
+@end
+
+@implementation DiffGutterView {
+	__weak DiffView* _owner;
+	NSUInteger _side;
+}
+
+- (instancetype) initWithOwner:(DiffView*)owner side:(NSUInteger)side {
+	if ((self = [super initWithFrame:NSZeroRect])) {
+		clip_to_bounds(self);
+		_owner = owner;
+		_side = side;
+	}
+	return self;
+}
+
+- (BOOL) isFlipped { return YES; }
+- (BOOL) isOpaque { return YES; }
+
+- (void) drawRect:(NSRect)dirtyRect {
+	NSRect dirty = NSIntersectionRect(dirtyRect, self.bounds);
+	[[NSColor textBackgroundColor] setFill];
+	NSRectFill(dirty);
+	DiffView* owner = _owner;
+	DtFileDiff* diff = owner.diff;
+	if (!diff) return;
+
+	CGFloat offset = [owner verticalOffset:_side];
+	size_t first, last;
+	[owner rowsFrom:NSMinY(dirty) + offset to:NSMaxY(dirty) + offset first:&first last:&last];
+	CGFloat width = NSWidth(self.bounds);
+	for (size_t row = first; row < last; row++) {
+		NSRect frame = NSMakeRect(0, [owner rowY:row] - offset, width, owner.lineHeight);
+		int32_t lineIndex = dt_file_diff_row_line(diff, row, (uint8_t)_side);
+		if (lineIndex < 0) {
+			[g_filler_color setFill];
+			NSRectFill(frame);
+			continue;
+		}
+
+		DtLine line = dt_file_diff_line(diff, (uint8_t)_side, (size_t)lineIndex);
+		BOOL changed = line.kind != DT_LINE_EQUAL && line.kind < 4;
+		BOOL current = changed && [owner rowInCurrentHunk:row];
+		if (changed) {
+			[(current ? g_current_color : g_line_colors[line.kind]) setFill];
+			NSRectFill(frame);
+		}
+		NSDictionary* attributes = current ? owner.currentNumberAttributes : owner.numberAttributes;
+		NSString* number = [NSString stringWithFormat:@"%ld", (long)lineIndex + 1];
+		NSSize size = [number sizeWithAttributes:attributes];
+		[number drawAtPoint:NSMakePoint(width - kGutterPadding - size.width, NSMinY(frame) + owner.textInset) withAttributes:attributes];
+	}
+	[owner drawHunksInRect:dirty offset:offset bands:NO];
+}
+
+@end
+
+@implementation DiffConnectorView {
+	__weak DiffView* _owner;
+	NSUInteger _side;
+}
+
+- (instancetype) initWithOwner:(DiffView*)owner side:(NSUInteger)side {
+	if ((self = [super initWithFrame:NSZeroRect])) {
+		clip_to_bounds(self);
+		_owner = owner;
+		_side = side;
+	}
+	return self;
+}
+
+- (BOOL) isFlipped { return YES; }
+- (BOOL) isOpaque { return YES; }
+
+- (void) drawRect:(NSRect)dirtyRect {
+	NSRect dirty = NSIntersectionRect(dirtyRect, self.bounds);
+	[g_middle_color setFill];
+	NSRectFill(dirty);
+	DiffView* owner = _owner;
+	[owner drawHunksInRect:dirty offset:[owner verticalOffset:_side] bands:YES];
+}
+
+@end
+
+@implementation DiffPaneView {
+	__weak DiffView* _owner;
+	uint32_t _maxColumns;
+	/* The selection, from _anchor where it started to _head, or none when _anchor.line < 0. */
+	TextPosition _anchor;
+	TextPosition _head;
+}
+
+- (instancetype) initWithOwner:(DiffView*)owner side:(NSUInteger)side {
+	if ((self = [super initWithFrame:NSZeroRect])) {
+		clip_to_bounds(self);
+		_owner = owner;
+		_side = side;
+		_anchor = kNoPosition;
+		_head = kNoPosition;
+	}
+	return self;
 }
 
 - (BOOL) isFlipped { return YES; }
@@ -295,125 +673,51 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 }
 
 - (void) windowKeyDidChange:(NSNotification*)notification {
-	if (_selectionSide >= 0) [self setNeedsDisplay:YES];
+	if ([self hasSelection]) [self setNeedsDisplay:YES];
 }
 
-- (void) setDiff:(DtFileDiff*)diff {
-	if (diff == _diff) return;
-	dt_file_diff_free(_diff);
-	_diff = diff;
-	_currentHunk = diff && dt_file_diff_hunk_count(diff) > 0 ? 0 : -1;
-	_selectionSide = -1;
-
+- (void) diffDidChange {
+	DtFileDiff* diff = _owner.diff;
+	_anchor = kNoPosition;
+	_head = kNoPosition;
 	_maxColumns = 0;
-	_maxLines = 0;
-	for (NSUInteger side = 0; diff && side < kSideCount; side++) {
-		size_t count = dt_file_diff_line_count(diff, (uint8_t)side);
-		if (count > _maxLines) _maxLines = count;
-		for (size_t i = 0; i < count; i++) {
-			uint32_t columns = dt_file_diff_line(diff, (uint8_t)side, i).columns;
-			if (columns > _maxColumns) _maxColumns = columns;
-		}
+	size_t count = diff ? dt_file_diff_line_count(diff, (uint8_t)_side) : 0;
+	for (size_t i = 0; i < count; i++) {
+		uint32_t columns = dt_file_diff_line(diff, (uint8_t)_side, i).columns;
+		if (columns > _maxColumns) _maxColumns = columns;
 	}
-
 	[self relayout];
 	[self scrollPoint:NSZeroPoint];
 	[self setNeedsDisplay:YES];
 }
 
-- (void) setFontSize:(CGFloat)fontSize {
-	_fontSize = fontSize;
-	_font = [NSFont monospacedSystemFontOfSize:fontSize weight:NSFontWeightRegular];
-	NSLayoutManager* layoutManager = [[NSLayoutManager alloc] init];
-	_fontLineHeight = [layoutManager defaultLineHeightForFont:_font];
-	_lineHeight = ceil(_fontLineHeight * 1.3);
-	_textInset = floor((_lineHeight - _fontLineHeight) / 2);
-	_charWidth = [@"0" sizeWithAttributes:@{NSFontAttributeName: _font}].width;
-
-	NSArray* tabStops = @[];
-	CFArrayRef tabStopsRef = (__bridge CFArrayRef)tabStops;
-	CGFloat tabInterval = _charWidth * kTabWidth;
-	CTParagraphStyleSetting settings[] = {
-		{kCTParagraphStyleSpecifierTabStops, sizeof tabStopsRef, &tabStopsRef},
-		{kCTParagraphStyleSpecifierDefaultTabInterval, sizeof tabInterval, &tabInterval},
-	};
-	id paragraph = CFBridgingRelease(CTParagraphStyleCreate(settings, sizeof settings / sizeof settings[0]));
-	_textAttributes = @{
-		(__bridge NSString*)kCTFontAttributeName: _font,
-		(__bridge NSString*)kCTParagraphStyleAttributeName: paragraph,
-		(__bridge NSString*)kCTForegroundColorFromContextAttributeName: @YES
-	};
-	NSFont* numberFont = [NSFont monospacedDigitSystemFontOfSize:fontSize weight:NSFontWeightRegular];
-	_numberAttributes = @{
-		NSFontAttributeName: numberFont,
-		NSForegroundColorAttributeName: [NSColor secondaryLabelColor]
-	};
-	_currentNumberAttributes = @{
-		NSFontAttributeName: numberFont,
-		NSForegroundColorAttributeName: [NSColor whiteColor]
-	};
-
-	[self relayout];
-	[self setNeedsDisplay:YES];
-}
-
-- (void) setCurrentHunk:(NSInteger)currentHunk {
-	_currentHunk = currentHunk;
-	[self setNeedsDisplay:YES];
-}
-
 /* Size the view to fit its rows and its widest line, and at least fill the scroll view. */
 - (void) relayout {
+	DiffView* owner = _owner;
+	DtFileDiff* diff = owner.diff;
 	NSSize visible = self.enclosingScrollView ? self.enclosingScrollView.contentSize : self.frame.size;
-	size_t rows = _diff ? dt_file_diff_row_count(_diff) : 0;
-
-	int digits = 3;
-	for (size_t n = _maxLines; n >= 1000; n /= 10) digits++;
-	CGFloat digitWidth = [@"0" sizeWithAttributes:_numberAttributes].width;
-	_gutterWidth = ceil(digits * digitWidth + 2 * kGutterPadding);
-
-	CGFloat pane = _gutterWidth + 2 * kTextPadding + (CGFloat)_maxColumns * _charWidth;
-	CGFloat width = fmax(visible.width, (CGFloat)kSideCount * pane + (CGFloat)(kSideCount - 1) * kMiddleWidth);
-	CGFloat height = fmax(visible.height, 2 * kTopPadding + (CGFloat)rows * _lineHeight);
-	[self setFrameSize:NSMakeSize(floor(width), ceil(height))];
+	size_t rows = diff ? dt_file_diff_row_count(diff) : 0;
+	CGFloat width = fmax(visible.width, 2 * kTextPadding + (CGFloat)_maxColumns * owner.charWidth);
+	CGFloat height = fmax(visible.height, 2 * kTopPadding + (CGFloat)rows * owner.lineHeight);
+	[self setFrameSize:NSMakeSize(ceil(width), ceil(height))];
 	[self.window invalidateCursorRectsForView:self];
 	[self setNeedsDisplay:YES];
 }
 
-- (CGFloat) paneWidth {
-	return floor((NSWidth(self.bounds) - (CGFloat)(kSideCount - 1) * kMiddleWidth) / (CGFloat)kSideCount);
-}
-
-- (CGFloat) paneX:(NSUInteger)side {
-	return (CGFloat)side * ([self paneWidth] + kMiddleWidth);
-}
-
-/* Where a side's text starts, after its line number gutter. */
-- (CGFloat) textX:(NSUInteger)side {
-	return [self paneX:side] + _gutterWidth + kTextPadding;
-}
-
-- (CGFloat) rowY:(size_t)row {
-	return kTopPadding + (CGFloat)row * _lineHeight;
-}
-
 - (void) resetCursorRects {
-	for (NSUInteger side = 0; side < kSideCount; side++) {
-		CGFloat x = [self textX:side];
-		NSRect text = NSMakeRect(x, 0, [self paneX:side] + [self paneWidth] - x, NSHeight(self.bounds));
-		[self addCursorRect:text cursor:[NSCursor IBeamCursor]];
-	}
+	[self addCursorRect:self.bounds cursor:[NSCursor IBeamCursor]];
 }
 
 #pragma mark Text
 
-- (NSString*) textOfLine:(NSInteger)line side:(NSUInteger)side {
-	if (!_diff || line < 0) return @"";
-	return dt_string(dt_file_diff_line(_diff, (uint8_t)side, (size_t)line).text);
+- (NSString*) textOfLine:(NSInteger)line {
+	DtFileDiff* diff = _owner.diff;
+	if (!diff || line < 0) return @"";
+	return dt_string(dt_file_diff_line(diff, (uint8_t)_side, (size_t)line).text);
 }
 
 - (CTLineRef) createCTLine:(NSString*)text CF_RETURNS_RETAINED {
-	NSAttributedString* string = [[NSAttributedString alloc] initWithString:text attributes:_textAttributes];
+	NSAttributedString* string = [[NSAttributedString alloc] initWithString:text attributes:_owner.textAttributes];
 	return CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)string);
 }
 
@@ -423,87 +727,40 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 
 #pragma mark Drawing
 
-- (void) drawRect:(NSRect)dirty {
+- (void) drawRect:(NSRect)dirtyRect {
+	NSRect dirty = NSIntersectionRect(dirtyRect, self.bounds);
 	[[NSColor textBackgroundColor] setFill];
 	NSRectFill(dirty);
-	if (!_diff) return;
+	DiffView* owner = _owner;
+	if (!owner.diff) return;
 
-	CGFloat paneWidth = [self paneWidth];
-	for (NSUInteger side = 0; side + 1 < kSideCount; side++) {
-		[g_middle_color setFill];
-		NSRect middle = NSMakeRect([self paneX:side] + paneWidth, 0, kMiddleWidth, NSHeight(self.bounds));
-		NSRectFill(NSIntersectionRect(middle, dirty));
-	}
-
-	size_t rowCount = dt_file_diff_row_count(_diff);
-	size_t hunkCount = dt_file_diff_hunk_count(_diff);
-	CGFloat firstY = NSMinY(dirty) - kTopPadding;
-	size_t first = firstY > 0 ? (size_t)floor(firstY / _lineHeight) : 0;
-	size_t last = (size_t)fmax(0, ceil((NSMaxY(dirty) - kTopPadding) / _lineHeight));
-	if (last > rowCount) last = rowCount;
-
-	DtHunk current = {0};
-	BOOL hasCurrent = _currentHunk >= 0 && (size_t)_currentHunk < hunkCount;
-	if (hasCurrent) current = dt_file_diff_hunk(_diff, (size_t)_currentHunk);
-
+	size_t first, last;
+	[owner rowsFrom:NSMinY(dirty) to:NSMaxY(dirty) first:&first last:&last];
 	for (size_t row = first; row < last; row++) {
-		BOOL inCurrent = hasCurrent && row >= current.row_start && row < current.row_end;
-		for (NSUInteger side = 0; side < kSideCount; side++) {
-			int32_t lineIndex = dt_file_diff_row_line(_diff, row, (uint8_t)side);
-			NSRect frame = NSMakeRect([self paneX:side], [self rowY:row], paneWidth, _lineHeight);
-			[self drawLine:lineIndex side:side frame:frame current:inCurrent];
-		}
+		NSRect frame = NSMakeRect(0, [owner rowY:row], NSWidth(self.bounds), owner.lineHeight);
+		[self drawLine:dt_file_diff_row_line(owner.diff, row, (uint8_t)_side) frame:frame];
 	}
-
-	/* Hunk outlines, and bands joining the panes across the middle gutters. */
-	for (size_t i = 0; i < hunkCount; i++) {
-		DtHunk hunk = dt_file_diff_hunk(_diff, i);
-		CGFloat top = [self rowY:hunk.row_start];
-		CGFloat bottom = [self rowY:hunk.row_end];
-		if (bottom < NSMinY(dirty) - 1 || top > NSMaxY(dirty) + 1) continue;
-		uint8_t kind = hunk_kind(hunk);
-		[g_line_colors[kind] setFill];
-		for (NSUInteger side = 0; side + 1 < kSideCount; side++) {
-			NSRectFill(NSMakeRect([self paneX:side] + paneWidth, top, kMiddleWidth, bottom - top));
-		}
-		[g_edge_colors[kind] setFill];
-		NSRectFill(NSMakeRect(0, top, NSWidth(self.bounds), 1));
-		NSRectFill(NSMakeRect(0, bottom - 1, NSWidth(self.bounds), 1));
-	}
+	[owner drawHunksInRect:dirty offset:0 bands:NO];
 }
 
-- (void) drawLine:(int32_t)lineIndex side:(NSUInteger)side frame:(NSRect)frame current:(BOOL)current {
+- (void) drawLine:(int32_t)lineIndex frame:(NSRect)frame {
 	if (lineIndex < 0) {
 		[g_filler_color setFill];
 		NSRectFill(frame);
 		return;
 	}
 
-	DtLine line = dt_file_diff_line(_diff, (uint8_t)side, (size_t)lineIndex);
+	DiffView* owner = _owner;
+	DtLine line = dt_file_diff_line(owner.diff, (uint8_t)_side, (size_t)lineIndex);
 	BOOL changed = line.kind != DT_LINE_EQUAL && line.kind < 4;
 	if (changed) {
 		[g_line_colors[line.kind] setFill];
 		NSRectFill(frame);
 	}
 
-	NSRect gutter = NSMakeRect(NSMinX(frame), NSMinY(frame), _gutterWidth, NSHeight(frame));
-	if (current && changed) {
-		[g_current_color setFill];
-		NSRectFill(gutter);
-	}
-	NSDictionary* numberAttributes = current && changed ? _currentNumberAttributes : _numberAttributes;
-	NSString* number = [NSString stringWithFormat:@"%ld", (long)lineIndex + 1];
-	NSSize numberSize = [number sizeWithAttributes:numberAttributes];
-	NSPoint numberPoint = NSMakePoint(NSMaxX(gutter) - kGutterPadding - numberSize.width, NSMinY(frame) + _textInset);
-	[number drawAtPoint:numberPoint withAttributes:numberAttributes];
-
 	NSString* text = dt_string(line.text);
-	CGFloat textX = [self textX:side];
-	NSRect textFrame = NSMakeRect(textX - kTextPadding, NSMinY(frame), NSMaxX(frame) - textX + kTextPadding, NSHeight(frame));
+	CGFloat textX = kTextPadding;
 	CTLineRef ctLine = [self createCTLine:text];
-
-	[NSGraphicsContext saveGraphicsState];
-	NSRectClip(textFrame);
 
 	for (uint32_t i = 0; changed && i < line.span_count; i++) {
 		DtSpan span = line.spans[i];
@@ -511,14 +768,14 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 		CGFloat x0 = textX + [self offsetOfIndex:span.start16 inLine:ctLine];
 		CGFloat x1 = textX + [self offsetOfIndex:span.end16 inLine:ctLine];
 		[g_emphasis_colors[line.kind] setFill];
-		NSRectFill(NSMakeRect(x0, NSMinY(frame) + _textInset, x1 - x0, _fontLineHeight));
+		NSRectFill(NSMakeRect(x0, NSMinY(frame) + owner.textInset, x1 - x0, owner.fontLineHeight));
 	}
 
 	NSUInteger from = 0, to = 0;
 	BOOL throughEnd = NO;
-	if ([self selectionInLine:lineIndex side:side from:&from to:&to throughEnd:&throughEnd]) {
+	if ([self selectionInLine:lineIndex from:&from to:&to throughEnd:&throughEnd]) {
 		CGFloat x0 = textX + [self offsetOfIndex:from inLine:ctLine];
-		CGFloat x1 = throughEnd ? NSMaxX(textFrame) : textX + [self offsetOfIndex:to inLine:ctLine];
+		CGFloat x1 = throughEnd ? NSMaxX(frame) : textX + [self offsetOfIndex:to inLine:ctLine];
 		BOOL active = self.window.isKeyWindow && self.window.firstResponder == self;
 		[(active ? [NSColor selectedTextBackgroundColor] : [NSColor unemphasizedSelectedTextBackgroundColor]) setFill];
 		NSRectFill(NSMakeRect(x0, NSMinY(frame), x1 - x0, NSHeight(frame)));
@@ -528,17 +785,22 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	[[NSColor textColor] setFill];
 	/* Core Text draws upside down in a flipped view unless its text matrix flips it back. */
 	CGContextSetTextMatrix(context, CGAffineTransformMakeScale(1, -1));
-	CGContextSetTextPosition(context, textX, NSMinY(frame) + _textInset + _font.ascender);
+	CGContextSetTextPosition(context, textX, NSMinY(frame) + owner.textInset + owner.font.ascender);
 	CTLineDraw(ctLine, context);
-
-	[NSGraphicsContext restoreGraphicsState];
 	CFRelease(ctLine);
 }
 
 #pragma mark Selection
 
 - (BOOL) hasSelection {
-	return _selectionSide >= 0 && !position_equal(_anchor, _head);
+	return _anchor.line >= 0 && !position_equal(_anchor, _head);
+}
+
+- (void) clearSelection {
+	if (_anchor.line < 0) return;
+	_anchor = kNoPosition;
+	_head = kNoPosition;
+	[self setNeedsDisplay:YES];
 }
 
 /* The selection's start and end, in order. */
@@ -549,8 +811,8 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 }
 
 /* The selected part of a line, and whether the selection continues past its end. */
-- (BOOL) selectionInLine:(NSInteger)line side:(NSUInteger)side from:(NSUInteger*)from to:(NSUInteger*)to throughEnd:(BOOL*)throughEnd {
-	if (![self hasSelection] || (NSUInteger)_selectionSide != side) return NO;
+- (BOOL) selectionInLine:(NSInteger)line from:(NSUInteger*)from to:(NSUInteger*)to throughEnd:(BOOL*)throughEnd {
+	if (![self hasSelection]) return NO;
 	TextPosition start, end;
 	[self selectionStart:&start end:&end];
 	if (line < start.line || line > end.line) return NO;
@@ -564,10 +826,9 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	if (![self hasSelection]) return @"";
 	TextPosition start, end;
 	[self selectionStart:&start end:&end];
-	NSUInteger side = (NSUInteger)_selectionSide;
 	NSMutableString* text = [NSMutableString string];
 	for (NSInteger line = start.line; line <= end.line; line++) {
-		NSString* lineText = [self textOfLine:line side:side];
+		NSString* lineText = [self textOfLine:line];
 		NSUInteger from = line == start.line ? min_index(start.index, lineText.length) : 0;
 		NSUInteger to = line == end.line ? min_index(end.index, lineText.length) : lineText.length;
 		if (to > from) [text appendString:[lineText substringWithRange:NSMakeRange(from, to - from)]];
@@ -576,53 +837,45 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	return text;
 }
 
-- (void) selectFrom:(TextPosition)anchor to:(TextPosition)head side:(NSUInteger)side {
-	_selectionSide = (NSInteger)side;
+- (void) selectFrom:(TextPosition)anchor to:(TextPosition)head {
 	_anchor = anchor;
 	_head = head;
+	[_owner paneDidSelect:self];
 	[self setNeedsDisplay:YES];
 }
 
-/* The side under x, picking the nearer one in the middle gutters. */
-- (NSUInteger) sideAtX:(CGFloat)x {
-	CGFloat stride = [self paneWidth] + kMiddleWidth;
-	CGFloat side = floor((x + kMiddleWidth / 2) / stride);
-	if (side < 0) return 0;
-	if (side >= (CGFloat)kSideCount) return kSideCount - 1;
-	return (NSUInteger)side;
-}
-
-/* The caret position nearest a point, in the given side's text. */
-- (TextPosition) positionAtPoint:(NSPoint)point side:(NSUInteger)side {
-	if (!_diff) return kNoPosition;
-	size_t rows = dt_file_diff_row_count(_diff);
-	size_t lines = dt_file_diff_line_count(_diff, (uint8_t)side);
+/* The caret position nearest a point. */
+- (TextPosition) positionAtPoint:(NSPoint)point {
+	DtFileDiff* diff = _owner.diff;
+	if (!diff) return kNoPosition;
+	size_t rows = dt_file_diff_row_count(diff);
+	size_t lines = dt_file_diff_line_count(diff, (uint8_t)_side);
 	if (rows == 0 || lines == 0) return kNoPosition;
 	if (point.y < kTopPadding) return (TextPosition){0, 0};
 
-	size_t row = (size_t)floor((point.y - kTopPadding) / _lineHeight);
+	size_t row = (size_t)floor((point.y - kTopPadding) / _owner.lineHeight);
 	if (row >= rows) {
 		NSInteger lastLine = (NSInteger)lines - 1;
-		return (TextPosition){lastLine, [self textOfLine:lastLine side:side].length};
+		return (TextPosition){lastLine, [self textOfLine:lastLine].length};
 	}
 
-	int32_t line = dt_file_diff_row_line(_diff, row, (uint8_t)side);
+	int32_t line = dt_file_diff_row_line(diff, row, (uint8_t)_side);
 	if (line < 0) {
 		/* A filler row: the end of the line before it, or else the start of the line after. */
 		for (size_t r = row; r-- > 0;) {
-			int32_t before = dt_file_diff_row_line(_diff, r, (uint8_t)side);
-			if (before >= 0) return (TextPosition){before, [self textOfLine:before side:side].length};
+			int32_t before = dt_file_diff_row_line(diff, r, (uint8_t)_side);
+			if (before >= 0) return (TextPosition){before, [self textOfLine:before].length};
 		}
 		for (size_t r = row + 1; r < rows; r++) {
-			int32_t after = dt_file_diff_row_line(_diff, r, (uint8_t)side);
+			int32_t after = dt_file_diff_row_line(diff, r, (uint8_t)_side);
 			if (after >= 0) return (TextPosition){after, 0};
 		}
 		return kNoPosition;
 	}
 
-	CGFloat x = point.x - [self textX:side];
+	CGFloat x = point.x - kTextPadding;
 	if (x <= 0) return (TextPosition){line, 0};
-	NSString* text = [self textOfLine:line side:side];
+	NSString* text = [self textOfLine:line];
 	CTLineRef ctLine = [self createCTLine:text];
 	CFIndex index = CTLineGetStringIndexForPosition(ctLine, CGPointMake(x, 0));
 	CFRelease(ctLine);
@@ -632,35 +885,23 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 
 - (void) mouseDown:(NSEvent*)event {
 	[self.window makeFirstResponder:self];
-	if (!_diff) return;
+	DiffView* owner = _owner;
+	DtFileDiff* diff = owner.diff;
+	if (!diff) return;
 	NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
+	if (point.y >= kTopPadding) [owner selectHunkAtRow:(size_t)floor((point.y - kTopPadding) / owner.lineHeight)];
 
-	if (point.y >= kTopPadding) {
-		size_t row = (size_t)floor((point.y - kTopPadding) / _lineHeight);
-		size_t count = dt_file_diff_hunk_count(_diff);
-		for (size_t i = 0; i < count; i++) {
-			DtHunk hunk = dt_file_diff_hunk(_diff, i);
-			if (row >= hunk.row_start && row < hunk.row_end) {
-				self.currentHunk = (NSInteger)i;
-				if (_currentHunkChanged) _currentHunkChanged();
-				break;
-			}
-		}
-	}
-
-	NSUInteger side = [self sideAtX:point.x];
-	BOOL extend = (event.modifierFlags & NSEventModifierFlagShift) && _selectionSide == (NSInteger)side;
-	TextPosition position = [self positionAtPoint:point side:side];
+	BOOL extend = (event.modifierFlags & NSEventModifierFlagShift) && _anchor.line >= 0;
+	TextPosition position = [self positionAtPoint:point];
 	if (position.line < 0) {
-		_selectionSide = -1;
-		[self setNeedsDisplay:YES];
+		[self clearSelection];
 		return;
 	}
 
 	if (extend) {
-		[self selectFrom:_anchor to:position side:side];
+		[self selectFrom:_anchor to:position];
 	} else if (event.clickCount == 2) {
-		NSString* text = [self textOfLine:position.line side:side];
+		NSString* text = [self textOfLine:position.line];
 		NSRange word = NSMakeRange(position.index, 0);
 		if (text.length > 0) {
 			NSAttributedString* string = [[NSAttributedString alloc] initWithString:text];
@@ -668,24 +909,24 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 		}
 		TextPosition start = {position.line, word.location};
 		TextPosition end = {position.line, NSMaxRange(word)};
-		[self selectFrom:start to:end side:side];
+		[self selectFrom:start to:end];
 	} else if (event.clickCount >= 3) {
 		/* The whole line, through its line break when there's a next line. */
 		TextPosition start = {position.line, 0};
-		TextPosition end = {position.line, [self textOfLine:position.line side:side].length};
-		if ((size_t)position.line + 1 < dt_file_diff_line_count(_diff, (uint8_t)side)) {
+		TextPosition end = {position.line, [self textOfLine:position.line].length};
+		if ((size_t)position.line + 1 < dt_file_diff_line_count(diff, (uint8_t)_side)) {
 			end = (TextPosition){position.line + 1, 0};
 		}
-		[self selectFrom:start to:end side:side];
+		[self selectFrom:start to:end];
 	} else {
-		[self selectFrom:position to:position side:side];
+		[self selectFrom:position to:position];
 	}
 
-	[self trackSelectionFrom:event side:side];
+	[self trackSelectionFrom:event];
 }
 
 /* Extend the selection until the mouse is released, scrolling while it's outside the view. */
-- (void) trackSelectionFrom:(NSEvent*)event side:(NSUInteger)side {
+- (void) trackSelectionFrom:(NSEvent*)event {
 	NSEvent* drag = event;
 	[NSEvent startPeriodicEventsAfterDelay:0.1 withPeriod:0.05];
 	for (;;) {
@@ -696,8 +937,8 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 		if (drag == event) continue;
 		[self autoscroll:drag];
 		NSPoint point = [self convertPoint:drag.locationInWindow fromView:nil];
-		TextPosition position = [self positionAtPoint:point side:side];
-		if (position.line >= 0 && !position_equal(position, _head)) [self selectFrom:_anchor to:position side:side];
+		TextPosition position = [self positionAtPoint:point];
+		if (position.line >= 0 && !position_equal(position, _head)) [self selectFrom:_anchor to:position];
 	}
 	[NSEvent stopPeriodicEvents];
 }
@@ -709,34 +950,20 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	[pasteboard setString:[self selectedText] forType:NSPasteboardTypeString];
 }
 
-/* Select all of the side last selected in, or else side A. */
 - (IBAction) selectAll:(id)sender {
-	if (!_diff) return;
-	NSUInteger side = _selectionSide >= 0 ? (NSUInteger)_selectionSide : 0;
-	size_t lines = dt_file_diff_line_count(_diff, (uint8_t)side);
+	DtFileDiff* diff = _owner.diff;
+	size_t lines = diff ? dt_file_diff_line_count(diff, (uint8_t)_side) : 0;
 	if (lines == 0) return;
 	NSInteger lastLine = (NSInteger)lines - 1;
 	TextPosition start = {0, 0};
-	TextPosition end = {lastLine, [self textOfLine:lastLine side:side].length};
-	[self selectFrom:start to:end side:side];
+	TextPosition end = {lastLine, [self textOfLine:lastLine].length};
+	[self selectFrom:start to:end];
 }
 
 - (BOOL) validateMenuItem:(NSMenuItem*)menuItem {
 	if (menuItem.action == @selector(copy:)) return [self hasSelection];
-	if (menuItem.action == @selector(selectAll:)) return _diff != NULL;
+	if (menuItem.action == @selector(selectAll:)) return _owner.diff != NULL;
 	return YES;
-}
-
-/* Scroll the current hunk to a third of the way down, unless it's already in view. */
-- (void) scrollToCurrentHunk {
-	if (!_diff || _currentHunk < 0 || (size_t)_currentHunk >= dt_file_diff_hunk_count(_diff)) return;
-	DtHunk hunk = dt_file_diff_hunk(_diff, (size_t)_currentHunk);
-	CGFloat top = [self rowY:hunk.row_start];
-	CGFloat bottom = [self rowY:hunk.row_end];
-	NSRect visible = self.visibleRect;
-	if (top >= NSMinY(visible) && bottom <= NSMaxY(visible)) return;
-	CGFloat y = fmax(0, top - floor(NSHeight(visible) / 3));
-	[self scrollPoint:NSMakePoint(NSMinX(visible), y)];
 }
 
 @end
@@ -938,11 +1165,6 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	_diffView.currentHunkChanged = ^(void) {
 		[weakSelf updateChangeLabel];
 	};
-	NSScrollView* diffScroll = [[NSScrollView alloc] init];
-	diffScroll.hasVerticalScroller = YES;
-	diffScroll.hasHorizontalScroller = YES;
-	diffScroll.autohidesScrollers = YES;
-	diffScroll.documentView = _diffView;
 
 	_message = [NSTextField wrappingLabelWithString:@""];
 	_message.alignment = NSTextAlignmentCenter;
@@ -970,9 +1192,9 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	_highlight = [[DropHighlightView alloc] initWithFrame:NSZeroRect];
 	detail.highlightView = _highlight;
 
-	add_subviews(detail, @[titles[0], titles[1], topSeparator, diffScroll, _message, bottomSeparator, bar, _highlight]);
+	add_subviews(detail, @[titles[0], titles[1], topSeparator, _diffView, _message, bottomSeparator, bar, _highlight]);
 	[NSLayoutConstraint activateConstraints:@[
-		/* Each title over its pane, as DiffView lays them out when not scrolled sideways. */
+		/* Each title over its side, as DiffView lays them out. */
 		[titles[0].leadingAnchor constraintEqualToAnchor:detail.leadingAnchor constant:12],
 		[titles[0].trailingAnchor constraintLessThanOrEqualToAnchor:detail.centerXAnchor constant:-kMiddleWidth / 2 - 8],
 		[titles[0].centerYAnchor constraintEqualToAnchor:detail.topAnchor constant:kHeaderHeight / 2],
@@ -985,13 +1207,13 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 		[topSeparator.trailingAnchor constraintEqualToAnchor:detail.trailingAnchor],
 		[topSeparator.heightAnchor constraintEqualToConstant:1],
 
-		[diffScroll.topAnchor constraintEqualToAnchor:topSeparator.bottomAnchor],
-		[diffScroll.leadingAnchor constraintEqualToAnchor:detail.leadingAnchor],
-		[diffScroll.trailingAnchor constraintEqualToAnchor:detail.trailingAnchor],
-		[diffScroll.bottomAnchor constraintEqualToAnchor:bottomSeparator.topAnchor],
+		[_diffView.topAnchor constraintEqualToAnchor:topSeparator.bottomAnchor],
+		[_diffView.leadingAnchor constraintEqualToAnchor:detail.leadingAnchor],
+		[_diffView.trailingAnchor constraintEqualToAnchor:detail.trailingAnchor],
+		[_diffView.bottomAnchor constraintEqualToAnchor:bottomSeparator.topAnchor],
 
-		[_message.centerXAnchor constraintEqualToAnchor:diffScroll.centerXAnchor],
-		[_message.centerYAnchor constraintEqualToAnchor:diffScroll.centerYAnchor],
+		[_message.centerXAnchor constraintEqualToAnchor:_diffView.centerXAnchor],
+		[_message.centerYAnchor constraintEqualToAnchor:_diffView.centerYAnchor],
 		[_message.widthAnchor constraintLessThanOrEqualToConstant:420],
 
 		[bottomSeparator.leadingAnchor constraintEqualToAnchor:detail.leadingAnchor],
