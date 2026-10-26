@@ -23,6 +23,13 @@ static NSString* const kWindowFrameDefault = @"WindowFrame";
 /* How far a new window is moved off a window already where it would open. */
 static const CGFloat kCascadeOffset = 22;
 
+/*
+ * Labels whose text may be too long hold their width below the sidebar's
+ * holding priority, so they truncate instead of making it narrower.
+ */
+static const NSLayoutPriority kSidebarHoldingPriority = NSLayoutPriorityDefaultLow + 10;
+static const NSLayoutPriority kSqueezablePriority = NSLayoutPriorityDefaultLow;
+
 /* The number of compared sides; a merge will add a base and a result. */
 static const NSUInteger kSideCount = 2;
 static const uint32_t kTabWidth = 4;
@@ -1978,6 +1985,7 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	_sidebarTitle = [NSTextField labelWithString:@""];
 	_sidebarTitle.font = [NSFont systemFontOfSize:13 weight:NSFontWeightMedium];
 	_sidebarTitle.lineBreakMode = NSLineBreakByTruncatingTail;
+	[_sidebarTitle setContentCompressionResistancePriority:kSqueezablePriority forOrientation:NSLayoutConstraintOrientationHorizontal];
 
 	_spinner = [[NSProgressIndicator alloc] init];
 	_spinner.style = NSProgressIndicatorStyleSpinning;
@@ -2026,6 +2034,8 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	for (NSUInteger side = 0; side < kSideCount; side++) {
 		NSTextField* title = [NSTextField labelWithString:@""];
 		title.lineBreakMode = NSLineBreakByTruncatingMiddle;
+		/* Truncate a long name rather than push the sidebar narrower. */
+		[title setContentCompressionResistancePriority:kSqueezablePriority forOrientation:NSLayoutConstraintOrientationHorizontal];
 		[titles addObject:title];
 	}
 	_paneTitles = titles;
@@ -2132,6 +2142,8 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	sidebarItem.minimumThickness = 180;
 	sidebarItem.maximumThickness = 480;
 	sidebarItem.canCollapse = YES;
+	/* Keep the sidebar's width as the window resizes, and against labels too long for theirs. */
+	sidebarItem.holdingPriority = kSidebarHoldingPriority;
 	NSSplitViewItem* detailItem = [NSSplitViewItem splitViewItemWithViewController:detailController];
 	detailItem.minimumThickness = 400;
 
