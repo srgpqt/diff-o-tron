@@ -15,6 +15,9 @@
 
 static NSString* const kComparisonType = @"Comparison";
 
+/* User defaults: the DiffView mode new windows start in. */
+static NSString* const kDiffModeDefault = @"DiffMode";
+
 /* The number of compared sides; a merge will add a base and a result. */
 static const NSUInteger kSideCount = 2;
 static const uint32_t kTabWidth = 4;
@@ -130,10 +133,17 @@ static NSColor* status_color(uint8_t status) {
 
 #pragma mark - Interfaces
 
-/* Draws a file diff as aligned side-by-side panes. */
+/* DiffView.mode */
+enum {
+	kDiffModeBlocks = 0, /* the sides' lines aligned, with filler where a side has none */
+	kDiffModeFluid = 1,  /* each side's lines together, with connectors joining the changes */
+};
+
+/* Draws a file diff as side-by-side panes. */
 @interface DiffView : NSView
 	/* Owned: freed when replaced. */
 	@property (nonatomic) DtFileDiff* diff;
+	@property (nonatomic) NSInteger mode;
 	@property (nonatomic) CGFloat fontSize;
 	/* Index of the highlighted hunk, or -1. */
 	@property (nonatomic) NSInteger currentHunk;
@@ -246,15 +256,30 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	@property (nonatomic, readonly) CGFloat textInset;
 	@property (nonatomic, readonly) CGFloat charWidth;
 	@property (nonatomic, readonly) CGFloat gutterWidth;
+	/* Where a row starts; in Fluid mode, where a line starts in its side's own layout. */
 	- (CGFloat) rowY:(size_t)row;
 	/* The rows from first up to last that overlap document coordinates top to bottom. */
 	- (void) rowsFrom:(CGFloat)top to:(CGFloat)bottom first:(size_t*)first last:(size_t*)last;
+	/* The same for a side's lines, in its own layout. */
+	- (void) linesFrom:(CGFloat)top to:(CGFloat)bottom side:(NSUInteger)side first:(size_t*)first last:(size_t*)last;
 	/* How far a side is scrolled down. */
 	- (CGFloat) verticalOffset:(NSUInteger)side;
+	/*
+	 * In Fluid mode, how far down a side's own layout is from the shared one,
+	 * so that a line at y in it shows at y - shift in the side's document; 0 in
+	 * Blocks mode.
+	 */
+	- (CGFloat) shift:(NSUInteger)side;
+	/* The lines a hunk covers on a side. */
+	- (void) hunk:(DtHunk)hunk side:(NSUInteger)side start:(uint32_t*)start end:(uint32_t*)end;
 	- (BOOL) rowInCurrentHunk:(size_t)row;
+	- (BOOL) lineInCurrentHunk:(size_t)line side:(NSUInteger)side;
 	/* Outline the hunks in dirty, drawn offset up, with bands filling them if bands is set. */
 	- (void) drawHunksInRect:(NSRect)dirty offset:(CGFloat)offset bands:(BOOL)bands;
+	/* In Fluid mode, outline a side's hunks in dirty, its own layout drawn offset up. */
+	- (void) drawSideHunks:(NSUInteger)side inRect:(NSRect)dirty offset:(CGFloat)offset;
 	- (void) selectHunkAtRow:(size_t)row;
+	- (void) selectHunkAtLine:(size_t)line side:(NSUInteger)side;
 	- (void) paneDidSelect:(DiffPaneView*)pane;
 @end
 
@@ -444,21 +469,85 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	return kTopPadding + (CGFloat)row * _lineHeight;
 }
 
-- (void) rowsFrom:(CGFloat)top to:(CGFloat)bottom first:(size_t*)first last:(size_t*)last {
-	size_t rowCount = _diff ? dt_file_diff_row_count(_diff) : 0;
+- (void) rowsFrom:(CGFloat)top to:(CGFloat)bottom count:(size_t)count first:(size_t*)first last:(size_t*)last {
 	*first = top > kTopPadding ? (size_t)floor((top - kTopPadding) / _lineHeight) : 0;
 	*last = (size_t)fmax(0, ceil((bottom - kTopPadding) / _lineHeight));
-	if (*last > rowCount) *last = rowCount;
+	if (*last > count) *last = count;
+}
+
+- (void) rowsFrom:(CGFloat)top to:(CGFloat)bottom first:(size_t*)first last:(size_t*)last {
+	size_t count = _diff ? dt_file_diff_row_count(_diff) : 0;
+	[self rowsFrom:top to:bottom count:count first:first last:last];
+}
+
+- (void) linesFrom:(CGFloat)top to:(CGFloat)bottom side:(NSUInteger)side first:(size_t*)first last:(size_t*)last {
+	size_t count = _diff ? dt_file_diff_line_count(_diff, (uint8_t)side) : 0;
+	[self rowsFrom:top to:bottom count:count first:first last:last];
 }
 
 - (CGFloat) verticalOffset:(NSUInteger)side {
 	return _scrolls[side].contentView.bounds.origin.y;
 }
 
+- (void) hunk:(DtHunk)hunk side:(NSUInteger)side start:(uint32_t*)start end:(uint32_t*)end {
+	*start = side == 0 ? hunk.a_start : hunk.b_start;
+	*end = side == 0 ? hunk.a_end : hunk.b_end;
+}
+
+/*
+ * Map a position in the shared layout, the Blocks layout's rows, to a side's own
+ * layout: one to one between hunks, and stretched or squeezed across each one.
+ * Positions are from the top of the first row.
+ */
+- (CGFloat) sidePosition:(CGFloat)position side:(NSUInteger)side {
+	/* The last hunk that starts at or before the position. */
+	size_t low = 0;
+	size_t high = dt_file_diff_hunk_count(_diff);
+	while (low < high) {
+		size_t middle = low + (high - low) / 2;
+		if ((CGFloat)dt_file_diff_hunk(_diff, middle).row_start * _lineHeight <= position) {
+			low = middle + 1;
+		} else {
+			high = middle;
+		}
+	}
+	if (low == 0) return position;
+
+	DtHunk hunk = dt_file_diff_hunk(_diff, low - 1);
+	uint32_t start, end;
+	[self hunk:hunk side:side start:&start end:&end];
+	CGFloat t0 = (CGFloat)hunk.row_start * _lineHeight;
+	CGFloat t1 = (CGFloat)hunk.row_end * _lineHeight;
+	CGFloat v0 = (CGFloat)start * _lineHeight;
+	CGFloat v1 = (CGFloat)end * _lineHeight;
+	if (position < t1) return v0 + (position - t0) * (v1 - v0) / (t1 - t0);
+	return v1 + (position - t1);
+}
+
+- (CGFloat) shift:(NSUInteger)side {
+	if (_mode != kDiffModeFluid || !_diff) return 0;
+	NSRect visible = _scrolls[side].contentView.bounds;
+	/*
+	 * Line the sides up at a point that moves from the top of the view to the
+	 * bottom as it scrolls down, so that they start and end together.
+	 */
+	CGFloat range = NSHeight(_panes[side].frame) - NSHeight(visible);
+	CGFloat fraction = range > 0 ? fmin(fmax(NSMinY(visible) / range, 0), 1) : 0;
+	CGFloat anchor = NSMinY(visible) + fraction * NSHeight(visible) - kTopPadding;
+	return [self sidePosition:anchor side:side] - anchor;
+}
+
 - (BOOL) rowInCurrentHunk:(size_t)row {
 	if (!_diff || _currentHunk < 0 || (size_t)_currentHunk >= dt_file_diff_hunk_count(_diff)) return NO;
 	DtHunk hunk = dt_file_diff_hunk(_diff, (size_t)_currentHunk);
 	return row >= hunk.row_start && row < hunk.row_end;
+}
+
+- (BOOL) lineInCurrentHunk:(size_t)line side:(NSUInteger)side {
+	if (!_diff || _currentHunk < 0 || (size_t)_currentHunk >= dt_file_diff_hunk_count(_diff)) return NO;
+	uint32_t start, end;
+	[self hunk:dt_file_diff_hunk(_diff, (size_t)_currentHunk) side:side start:&start end:&end];
+	return line >= start && line < end;
 }
 
 - (void) drawHunksInRect:(NSRect)dirty offset:(CGFloat)offset bands:(BOOL)bands {
@@ -480,6 +569,23 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	}
 }
 
+- (void) drawSideHunks:(NSUInteger)side inRect:(NSRect)dirty offset:(CGFloat)offset {
+	if (!_diff) return;
+	size_t count = dt_file_diff_hunk_count(_diff);
+	for (size_t i = 0; i < count; i++) {
+		DtHunk hunk = dt_file_diff_hunk(_diff, i);
+		uint32_t start, end;
+		[self hunk:hunk side:side start:&start end:&end];
+		CGFloat top = [self rowY:start] - offset;
+		CGFloat bottom = [self rowY:end] - offset;
+		if (bottom < NSMinY(dirty) - 1 || top > NSMaxY(dirty) + 1) continue;
+		/* A hunk with no lines on this side is a single line where they'd be. */
+		[g_edge_colors[hunk_kind(hunk)] setFill];
+		NSRectFill(NSMakeRect(NSMinX(dirty), top, NSWidth(dirty), 1));
+		if (bottom - top >= 2) NSRectFill(NSMakeRect(NSMinX(dirty), bottom - 1, NSWidth(dirty), 1));
+	}
+}
+
 /* Scroll every side up and down with whichever one scrolled. */
 - (void) clipViewBoundsDidChange:(NSNotification*)notification {
 	NSClipView* source = notification.object;
@@ -494,8 +600,17 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 		}
 		_syncingScroll = NO;
 	}
+	/* In Fluid mode, the sides' layouts shift as they scroll. */
+	if (_mode == kDiffModeFluid) {
+		for (NSView* view in _panes) [view setNeedsDisplay:YES];
+	}
 	for (NSView* view in _gutters) [view setNeedsDisplay:YES];
 	for (NSView* view in _connectors) [view setNeedsDisplay:YES];
+}
+
+- (void) setMode:(NSInteger)mode {
+	_mode = mode;
+	[self redrawAll];
 }
 
 - (void) selectHunkAtRow:(size_t)row {
@@ -503,6 +618,19 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	for (size_t i = 0; i < count; i++) {
 		DtHunk hunk = dt_file_diff_hunk(_diff, i);
 		if (row >= hunk.row_start && row < hunk.row_end) {
+			self.currentHunk = (NSInteger)i;
+			if (_currentHunkChanged) _currentHunkChanged();
+			return;
+		}
+	}
+}
+
+- (void) selectHunkAtLine:(size_t)line side:(NSUInteger)side {
+	size_t count = _diff ? dt_file_diff_hunk_count(_diff) : 0;
+	for (size_t i = 0; i < count; i++) {
+		uint32_t start, end;
+		[self hunk:dt_file_diff_hunk(_diff, i) side:side start:&start end:&end];
+		if (line >= start && line < end) {
 			self.currentHunk = (NSInteger)i;
 			if (_currentHunkChanged) _currentHunkChanged();
 			return;
@@ -557,32 +685,49 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	DtFileDiff* diff = owner.diff;
 	if (!diff) return;
 
-	CGFloat offset = [owner verticalOffset:_side];
-	size_t first, last;
-	[owner rowsFrom:NSMinY(dirty) + offset to:NSMaxY(dirty) + offset first:&first last:&last];
 	CGFloat width = NSWidth(self.bounds);
+	size_t first, last;
+	if (owner.mode == kDiffModeFluid) {
+		CGFloat offset = [owner verticalOffset:_side] + [owner shift:_side];
+		[owner linesFrom:NSMinY(dirty) + offset to:NSMaxY(dirty) + offset side:_side first:&first last:&last];
+		for (size_t line = first; line < last; line++) {
+			NSRect frame = NSMakeRect(0, [owner rowY:line] - offset, width, owner.lineHeight);
+			[self drawLine:(int32_t)line frame:frame current:[owner lineInCurrentHunk:line side:_side]];
+		}
+		[owner drawSideHunks:_side inRect:dirty offset:offset];
+		return;
+	}
+
+	CGFloat offset = [owner verticalOffset:_side];
+	[owner rowsFrom:NSMinY(dirty) + offset to:NSMaxY(dirty) + offset first:&first last:&last];
 	for (size_t row = first; row < last; row++) {
 		NSRect frame = NSMakeRect(0, [owner rowY:row] - offset, width, owner.lineHeight);
-		int32_t lineIndex = dt_file_diff_row_line(diff, row, (uint8_t)_side);
-		if (lineIndex < 0) {
-			[g_filler_color setFill];
-			NSRectFill(frame);
-			continue;
-		}
-
-		DtLine line = dt_file_diff_line(diff, (uint8_t)_side, (size_t)lineIndex);
-		BOOL changed = line.kind != DT_LINE_EQUAL && line.kind < 4;
-		BOOL current = changed && [owner rowInCurrentHunk:row];
-		if (changed) {
-			[(current ? g_current_color : g_line_colors[line.kind]) setFill];
-			NSRectFill(frame);
-		}
-		NSDictionary* attributes = current ? owner.currentNumberAttributes : owner.numberAttributes;
-		NSString* number = [NSString stringWithFormat:@"%ld", (long)lineIndex + 1];
-		NSSize size = [number sizeWithAttributes:attributes];
-		[number drawAtPoint:NSMakePoint(width - kGutterPadding - size.width, NSMinY(frame) + owner.textInset) withAttributes:attributes];
+		[self drawLine:dt_file_diff_row_line(diff, row, (uint8_t)_side) frame:frame current:[owner rowInCurrentHunk:row]];
 	}
 	[owner drawHunksInRect:dirty offset:offset bands:NO];
+}
+
+/* A line's number, or filler for none; highlighted if changed in the current hunk. */
+- (void) drawLine:(int32_t)lineIndex frame:(NSRect)frame current:(BOOL)inCurrentHunk {
+	if (lineIndex < 0) {
+		[g_filler_color setFill];
+		NSRectFill(frame);
+		return;
+	}
+
+	DiffView* owner = _owner;
+	DtLine line = dt_file_diff_line(owner.diff, (uint8_t)_side, (size_t)lineIndex);
+	BOOL changed = line.kind != DT_LINE_EQUAL && line.kind < 4;
+	BOOL current = changed && inCurrentHunk;
+	if (changed) {
+		[(current ? g_current_color : g_line_colors[line.kind]) setFill];
+		NSRectFill(frame);
+	}
+	NSDictionary* attributes = current ? owner.currentNumberAttributes : owner.numberAttributes;
+	NSString* number = [NSString stringWithFormat:@"%ld", (long)lineIndex + 1];
+	NSSize size = [number sizeWithAttributes:attributes];
+	NSPoint point = NSMakePoint(NSMaxX(frame) - kGutterPadding - size.width, NSMinY(frame) + owner.textInset);
+	[number drawAtPoint:point withAttributes:attributes];
 }
 
 @end
@@ -609,7 +754,49 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	[g_middle_color setFill];
 	NSRectFill(dirty);
 	DiffView* owner = _owner;
-	[owner drawHunksInRect:dirty offset:[owner verticalOffset:_side] bands:YES];
+	if (owner.mode != kDiffModeFluid) {
+		[owner drawHunksInRect:dirty offset:[owner verticalOffset:_side] bands:YES];
+		return;
+	}
+
+	/* Join each hunk on the side before to the same hunk on the side after. */
+	DtFileDiff* diff = owner.diff;
+	size_t count = diff ? dt_file_diff_hunk_count(diff) : 0;
+	NSUInteger next = _side + 1;
+	CGFloat offset = [owner verticalOffset:_side] + [owner shift:_side];
+	CGFloat nextOffset = [owner verticalOffset:next] + [owner shift:next];
+	CGFloat width = NSWidth(self.bounds);
+	for (size_t i = 0; i < count; i++) {
+		DtHunk hunk = dt_file_diff_hunk(diff, i);
+		uint32_t start, end, nextStart, nextEnd;
+		[owner hunk:hunk side:_side start:&start end:&end];
+		[owner hunk:hunk side:next start:&nextStart end:&nextEnd];
+		CGFloat top = [owner rowY:start] - offset;
+		CGFloat bottom = [owner rowY:end] - offset;
+		CGFloat nextTop = [owner rowY:nextStart] - nextOffset;
+		CGFloat nextBottom = [owner rowY:nextEnd] - nextOffset;
+		if (fmax(bottom, nextBottom) < NSMinY(dirty) - 1 || fmin(top, nextTop) > NSMaxY(dirty) + 1) continue;
+
+		uint8_t kind = hunk_kind(hunk);
+		NSBezierPath* band = [NSBezierPath bezierPath];
+		[band moveToPoint:NSMakePoint(0, top)];
+		[band lineToPoint:NSMakePoint(width, nextTop)];
+		[band lineToPoint:NSMakePoint(width, nextBottom)];
+		[band lineToPoint:NSMakePoint(0, bottom)];
+		[band closePath];
+		[g_line_colors[kind] setFill];
+		[band fill];
+
+		/* Edges along the hunks' outlines: the top's first pixel row, the bottom's last. */
+		NSBezierPath* edges = [NSBezierPath bezierPath];
+		edges.lineWidth = 1;
+		[edges moveToPoint:NSMakePoint(0, top + 0.5)];
+		[edges lineToPoint:NSMakePoint(width, nextTop + 0.5)];
+		[edges moveToPoint:NSMakePoint(0, fmax(top, bottom - 1) + 0.5)];
+		[edges lineToPoint:NSMakePoint(width, fmax(nextTop, nextBottom - 1) + 0.5)];
+		[g_edge_colors[kind] setStroke];
+		[edges stroke];
+	}
 }
 
 @end
@@ -636,6 +823,11 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 - (BOOL) isFlipped { return YES; }
 - (BOOL) isOpaque { return YES; }
 - (BOOL) acceptsFirstResponder { return YES; }
+
+/* In Fluid mode, what's drawn depends on where the pane is scrolled to, so it can't be drawn ahead. */
++ (BOOL) isCompatibleWithResponsiveScrolling {
+	return NO;
+}
 
 - (BOOL) becomeFirstResponder {
 	[self setNeedsDisplay:YES];
@@ -735,6 +927,17 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	if (!owner.diff) return;
 
 	size_t first, last;
+	if (owner.mode == kDiffModeFluid) {
+		CGFloat shift = [owner shift:_side];
+		[owner linesFrom:NSMinY(dirty) + shift to:NSMaxY(dirty) + shift side:_side first:&first last:&last];
+		for (size_t line = first; line < last; line++) {
+			NSRect frame = NSMakeRect(0, [owner rowY:line] - shift, NSWidth(self.bounds), owner.lineHeight);
+			[self drawLine:(int32_t)line frame:frame];
+		}
+		[owner drawSideHunks:_side inRect:dirty offset:shift];
+		return;
+	}
+
 	[owner rowsFrom:NSMinY(dirty) to:NSMaxY(dirty) first:&first last:&last];
 	for (size_t row = first; row < last; row++) {
 		NSRect frame = NSMakeRect(0, [owner rowY:row], NSWidth(self.bounds), owner.lineHeight);
@@ -845,23 +1048,40 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 }
 
 /* The caret position nearest a point. */
+/* The line at y in a Fluid mode layout, or -1 above the first line, or the line count below the last. */
+- (NSInteger) fluidLineAtY:(CGFloat)y {
+	DiffView* owner = _owner;
+	CGFloat position = y + [owner shift:_side] - kTopPadding;
+	if (position < 0) return -1;
+	size_t line = (size_t)floor(position / owner.lineHeight);
+	size_t lines = dt_file_diff_line_count(owner.diff, (uint8_t)_side);
+	return (NSInteger)(line < lines ? line : lines);
+}
+
 - (TextPosition) positionAtPoint:(NSPoint)point {
 	DtFileDiff* diff = _owner.diff;
 	if (!diff) return kNoPosition;
 	size_t rows = dt_file_diff_row_count(diff);
 	size_t lines = dt_file_diff_line_count(diff, (uint8_t)_side);
 	if (rows == 0 || lines == 0) return kNoPosition;
-	if (point.y < kTopPadding) return (TextPosition){0, 0};
+	NSInteger lastLine = (NSInteger)lines - 1;
 
-	size_t row = (size_t)floor((point.y - kTopPadding) / _owner.lineHeight);
-	if (row >= rows) {
-		NSInteger lastLine = (NSInteger)lines - 1;
-		return (TextPosition){lastLine, [self textOfLine:lastLine].length};
+	int32_t line;
+	if (_owner.mode == kDiffModeFluid) {
+		NSInteger fluidLine = [self fluidLineAtY:point.y];
+		if (fluidLine < 0) return (TextPosition){0, 0};
+		if (fluidLine > lastLine) return (TextPosition){lastLine, [self textOfLine:lastLine].length};
+		line = (int32_t)fluidLine;
+	} else {
+		if (point.y < kTopPadding) return (TextPosition){0, 0};
+		size_t row = (size_t)floor((point.y - kTopPadding) / _owner.lineHeight);
+		if (row >= rows) return (TextPosition){lastLine, [self textOfLine:lastLine].length};
+		line = dt_file_diff_row_line(diff, row, (uint8_t)_side);
 	}
 
-	int32_t line = dt_file_diff_row_line(diff, row, (uint8_t)_side);
 	if (line < 0) {
 		/* A filler row: the end of the line before it, or else the start of the line after. */
+		size_t row = (size_t)floor((point.y - kTopPadding) / _owner.lineHeight);
 		for (size_t r = row; r-- > 0;) {
 			int32_t before = dt_file_diff_row_line(diff, r, (uint8_t)_side);
 			if (before >= 0) return (TextPosition){before, [self textOfLine:before].length};
@@ -889,7 +1109,12 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	DtFileDiff* diff = owner.diff;
 	if (!diff) return;
 	NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
-	if (point.y >= kTopPadding) [owner selectHunkAtRow:(size_t)floor((point.y - kTopPadding) / owner.lineHeight)];
+	if (owner.mode == kDiffModeFluid) {
+		NSInteger line = [self fluidLineAtY:point.y];
+		if (line >= 0) [owner selectHunkAtLine:(size_t)line side:_side];
+	} else if (point.y >= kTopPadding) {
+		[owner selectHunkAtRow:(size_t)floor((point.y - kTopPadding) / owner.lineHeight)];
+	}
 
 	BOOL extend = (event.modifierFlags & NSEventModifierFlagShift) && _anchor.line >= 0;
 	TextPosition position = [self positionAtPoint:point];
@@ -1070,6 +1295,7 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	NSButton* _previousButton;
 	NSButton* _nextButton;
 	NSButton* _whitespaceCheckbox;
+	NSSegmentedControl* _modeControl;
 	DropHighlightView* _highlight;
 
 	NSMutableArray<SidebarItem*>* _items;
@@ -1165,6 +1391,9 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	_diffView.currentHunkChanged = ^(void) {
 		[weakSelf updateChangeLabel];
 	};
+	NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+	BOOL blocks = [defaults objectForKey:kDiffModeDefault] && [defaults integerForKey:kDiffModeDefault] == kDiffModeBlocks;
+	_diffView.mode = blocks ? kDiffModeBlocks : kDiffModeFluid;
 
 	_message = [NSTextField wrappingLabelWithString:@""];
 	_message.alignment = NSTextAlignmentCenter;
@@ -1182,9 +1411,18 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 		buttonWithImage:[NSImage imageWithSystemSymbolName:@"chevron.down" accessibilityDescription:@"Next Change"]
 		target:self
 		action:@selector(nextChange:)];
+	/* Segments in the order of the kDiffMode values. */
+	_modeControl = [NSSegmentedControl
+		segmentedControlWithLabels:@[@"Blocks", @"Fluid"]
+		trackingMode:NSSegmentSwitchTrackingSelectOne
+		target:self
+		action:@selector(modeControlDidChange:)];
+	_modeControl.selectedSegment = _diffView.mode;
 	NSStackView* bar = [[NSStackView alloc] init];
 	bar.edgeInsets = NSEdgeInsetsMake(0, 12, 0, 12);
-	[bar addView:_whitespaceCheckbox inGravity:NSStackViewGravityLeading];
+	bar.spacing = 12;
+	[bar addView:_modeControl inGravity:NSStackViewGravityLeading];
+	[bar addView:_whitespaceCheckbox inGravity:NSStackViewGravityTrailing];
 	[bar addView:_changeLabel inGravity:NSStackViewGravityTrailing];
 	[bar addView:_previousButton inGravity:NSStackViewGravityTrailing];
 	[bar addView:_nextButton inGravity:NSStackViewGravityTrailing];
@@ -1592,6 +1830,24 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	[self updateChangeLabel];
 }
 
+- (IBAction) showBlocks:(id)sender {
+	[self setDiffMode:kDiffModeBlocks];
+}
+
+- (IBAction) showFluid:(id)sender {
+	[self setDiffMode:kDiffModeFluid];
+}
+
+- (IBAction) modeControlDidChange:(id)sender {
+	[self setDiffMode:_modeControl.selectedSegment];
+}
+
+- (void) setDiffMode:(NSInteger)mode {
+	_diffView.mode = mode;
+	_modeControl.selectedSegment = mode;
+	[[NSUserDefaults standardUserDefaults] setInteger:mode forKey:kDiffModeDefault];
+}
+
 - (IBAction) toggleIgnoreWhitespace:(id)sender {
 	_ignoreWhitespace = !_ignoreWhitespace;
 	_whitespaceCheckbox.state = _ignoreWhitespace ? NSControlStateValueOn : NSControlStateValueOff;
@@ -1616,6 +1872,10 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	SEL action = menuItem.action;
 	if (action == @selector(toggleIgnoreWhitespace:)) {
 		menuItem.state = _ignoreWhitespace ? NSControlStateValueOn : NSControlStateValueOff;
+	} else if (action == @selector(showBlocks:)) {
+		menuItem.state = _diffView.mode == kDiffModeBlocks ? NSControlStateValueOn : NSControlStateValueOff;
+	} else if (action == @selector(showFluid:)) {
+		menuItem.state = _diffView.mode == kDiffModeFluid ? NSControlStateValueOn : NSControlStateValueOff;
 	} else if (action == @selector(previousChange:)) {
 		return _previousButton.enabled;
 	} else if (action == @selector(nextChange:)) {
@@ -1975,6 +2235,9 @@ static void build_main_menu(NSApplication* app) {
 		[viewMenu addItem:[NSMenuItem separatorItem]];
 		[viewMenu addItem:with_modifiers(_(@"Select Previous File", @selector(selectPreviousFile:), up), shiftCommand)];
 		[viewMenu addItem:with_modifiers(_(@"Select Next File", @selector(selectNextFile:), down), shiftCommand)];
+		[viewMenu addItem:[NSMenuItem separatorItem]];
+		[viewMenu addItem:_(@"Blocks", @selector(showBlocks:), @"1")];
+		[viewMenu addItem:_(@"Fluid", @selector(showFluid:), @"2")];
 		[viewMenu addItem:[NSMenuItem separatorItem]];
 		[viewMenu addItem:with_modifiers(_(@"Previous Change", @selector(previousChange:), up), command)];
 		[viewMenu addItem:with_modifiers(_(@"Next Change", @selector(nextChange:), down), command)];
