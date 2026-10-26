@@ -2,8 +2,10 @@
 #import <CoreText/CoreText.h>
 
 #include <math.h>
+#include <os/log.h>
 
 #include "diffotron.h"
+#include "macos-request.h"
 
 /*
  * The macOS front end: an NSDocument app where each document is a comparison of
@@ -22,6 +24,18 @@ static const CGFloat kBottomBarHeight = 32;
 static NSString* dt_string(DtStr s) {
 	NSString* string = [[NSString alloc] initWithBytes:s.ptr length:s.len encoding:NSUTF8StringEncoding];
 	return string ? string : @"";
+}
+
+/* See with `log stream --predicate 'subsystem == "com.srgpqt.diff-o-tron"'`. */
+static os_log_t open_log(void) {
+	static os_log_t log = NULL;
+	if (!log) log = os_log_create("com.srgpqt.diff-o-tron", "open");
+	return log;
+}
+
+static void post_request_notification(NSString* name, NSString* token) {
+	os_log(open_log(), "Posting %{public}@ for %{public}@", name, token);
+	[[NSDistributedNotificationCenter defaultCenter] postNotificationName:name object:token userInfo:nil deliverImmediately:YES];
 }
 
 static void add_subviews(NSView* parent, NSArray<NSView*>* views) {
@@ -153,15 +167,25 @@ static NSColor* status_color(uint8_t status) {
 	@property (nonatomic, readonly) BOOL comparing;
 	/* Incremented whenever the comparison is replaced. */
 	@property (nonatomic, readonly) NSUInteger generation;
+	/* Posted with kClosedNotification when the document closes. */
+	@property (nonatomic, copy) NSString* closeToken;
 	- (NSURL*) urlForSide:(NSUInteger)side;
+	/* Shown instead of a side's name, such as the repository path from git difftool; nil for none. */
+	- (NSString*) labelForSide:(NSUInteger)side;
+	/* The side's label, or else its file name. */
+	- (NSString*) nameForSide:(NSUInteger)side;
 	- (void) setURL:(NSURL*)url forSide:(NSUInteger)side;
 	/* Sets the sides from the first URLs. */
 	- (void) setURLs:(NSArray<NSURL*>*)urls;
+	/* Sets the sides and their labels (empty strings for none) from the first of each. */
+	- (void) setURLs:(NSArray<NSURL*>*)urls labels:(NSArray<NSString*>*)labels;
 	- (BOOL) isEmpty;
 @end
 
 @interface DiffDocumentController : NSDocumentController
-	- (void) openComparisonWithURLs:(NSArray<NSURL*>*)urls;
+	/* Open files opened together, such as the diffotron command's request and its files. */
+	- (void) openFilesAtURLs:(NSArray<NSURL*>*)urls;
+	- (DiffDocument*) openComparisonWithURLs:(NSArray<NSURL*>*)urls labels:(NSArray<NSString*>*)labels;
 @end
 
 @interface AppDelegate : NSObject <NSApplicationDelegate>
@@ -1041,7 +1065,8 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 
 - (void) reloadItems {
 	[_items removeAllObjects];
-	DtComparison* cmp = [self diffDocument].comparison;
+	DiffDocument* doc = [self diffDocument];
+	DtComparison* cmp = doc.comparison;
 	size_t count = cmp ? dt_comparison_count(cmp) : 0;
 	NSString* lastDir = @"";
 	for (size_t i = 0; i < count; i++) {
@@ -1060,6 +1085,12 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 
 		SidebarItem* item = [[SidebarItem alloc] init];
 		item.title = dt_string(entry.name);
+		/* Comparing two files: name them by their labels, when they have them. */
+		if (count == 1 && ([doc labelForSide:0] || [doc labelForSide:1])) {
+			NSString* a = [doc nameForSide:0];
+			NSString* b = [doc nameForSide:1];
+			item.title = [a isEqualToString:b] ? a : [NSString stringWithFormat:@"%@ → %@", a, b];
+		}
 		item.entry = i;
 		item.status = entry.status;
 		[_items addObject:item];
@@ -1115,8 +1146,11 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 			DtEntry entry = dt_comparison_entry(cmp, (size_t)_shownEntry);
 			path = dt_string(dt_comparison_entry_path(cmp, (size_t)_shownEntry, (uint8_t)side));
 			NSString* dir = dt_string(entry.dir);
+			NSString* label = [doc labelForSide:side];
 			if (path.length == 0) {
 				name = @"Not present";
+			} else if (label && dt_comparison_count(cmp) == 1 && dir.length == 0) {
+				name = label;
 			} else if (dir.length > 0) {
 				dir = [dir stringByReplacingOccurrencesOfString:@"/" withString:@" › "];
 				name = [NSString stringWithFormat:@"%@ › %@", dir, path.lastPathComponent];
@@ -1125,7 +1159,7 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 			}
 		} else {
 			NSURL* url = [doc urlForSide:side];
-			if (url) name = url.lastPathComponent;
+			if (url) name = [doc nameForSide:side];
 			path = url.path;
 		}
 
@@ -1389,12 +1423,18 @@ static id path_url(NSURL* url) {
 @implementation DiffDocument {
 	/* An NSURL or NSNull per side. */
 	NSMutableArray* _urls;
+	/* A label per side, empty for none. */
+	NSMutableArray<NSString*>* _labels;
 }
 
 - (instancetype) init {
 	if ((self = [super init])) {
 		_urls = [NSMutableArray array];
-		for (NSUInteger side = 0; side < kSideCount; side++) [_urls addObject:[NSNull null]];
+		_labels = [NSMutableArray array];
+		for (NSUInteger side = 0; side < kSideCount; side++) {
+			[_urls addObject:[NSNull null]];
+			[_labels addObject:@""];
+		}
 	}
 	return self;
 }
@@ -1411,15 +1451,32 @@ static id path_url(NSURL* url) {
 	[self addWindowController:[[DiffWindowController alloc] init]];
 }
 
+- (void) close {
+	NSString* token = _closeToken;
+	_closeToken = nil;
+	[super close];
+	if (token) post_request_notification(kClosedNotification, token);
+}
+
 - (NSString*) displayName {
-	NSURL* a = [self urlForSide:0];
-	NSURL* b = [self urlForSide:1];
+	NSString* a = [self urlForSide:0] ? [self nameForSide:0] : nil;
+	NSString* b = [self urlForSide:1] ? [self nameForSide:1] : nil;
 	if (a && b) {
-		if ([a.lastPathComponent isEqualToString:b.lastPathComponent]) return a.lastPathComponent;
-		return [NSString stringWithFormat:@"%@ ↔ %@", a.lastPathComponent, b.lastPathComponent];
+		if ([a isEqualToString:b]) return a;
+		return [NSString stringWithFormat:@"%@ ↔ %@", a, b];
 	}
-	if (a || b) return (a ? a : b).lastPathComponent;
+	if (a || b) return a ? a : b;
 	return @"New Comparison";
+}
+
+- (NSString*) labelForSide:(NSUInteger)side {
+	NSString* label = side < _labels.count ? _labels[side] : nil;
+	return label.length > 0 ? label : nil;
+}
+
+- (NSString*) nameForSide:(NSUInteger)side {
+	NSString* label = [self labelForSide:side];
+	return label ? label : [self urlForSide:side].lastPathComponent;
 }
 
 - (NSURL*) urlForSide:(NSUInteger)side {
@@ -1437,11 +1494,20 @@ static id path_url(NSURL* url) {
 - (void) setURL:(NSURL*)url forSide:(NSUInteger)side {
 	if (side >= kSideCount) return;
 	_urls[side] = path_url(url);
+	_labels[side] = @"";
 	[self urlsDidChange];
 }
 
 - (void) setURLs:(NSArray<NSURL*>*)urls {
-	for (NSUInteger side = 0; side < kSideCount && side < urls.count; side++) _urls[side] = path_url(urls[side]);
+	[self setURLs:urls labels:nil];
+}
+
+- (void) setURLs:(NSArray<NSURL*>*)urls labels:(NSArray<NSString*>*)labels {
+	for (NSUInteger side = 0; side < kSideCount && side < urls.count; side++) {
+		_urls[side] = path_url(urls[side]);
+		id label = side < labels.count ? labels[side] : nil;
+		_labels[side] = [label isKindOfClass:[NSString class]] ? label : @"";
+	}
 	[self urlsDidChange];
 }
 
@@ -1489,7 +1555,10 @@ static id path_url(NSURL* url) {
 
 #pragma mark - DiffDocumentController
 
-@implementation DiffDocumentController
+@implementation DiffDocumentController {
+	/* URLs AppKit opened one by one, gathered to open together. */
+	NSMutableArray<NSURL*>* _pendingURLs;
+}
 
 - (NSString*) defaultType {
 	return kComparisonType;
@@ -1516,13 +1585,83 @@ static id path_url(NSURL* url) {
 	panel.message = @"Choose two files or folders to compare.";
 	panel.prompt = @"Compare";
 	[panel beginWithCompletionHandler:^(NSModalResponse result) {
-		if (result == NSModalResponseOK) [self openComparisonWithURLs:panel.URLs];
+		if (result == NSModalResponseOK) [self openComparisonWithURLs:panel.URLs labels:nil];
 	}];
 }
 
+/*
+ * Files and folders opened from the Finder, the Dock, `open -a` or the
+ * diffotron command. AppKit opens them through the document controller one at
+ * a time, even when opened together, so gather them up.
+ */
+- (void) openDocumentWithContentsOfURL:(NSURL*)url display:(BOOL)display completionHandler:(void (^)(NSDocument*, BOOL, NSError*))completionHandler {
+	os_log(open_log(), "Document controller opening %{public}@", url);
+	if (!_pendingURLs) {
+		_pendingURLs = [NSMutableArray array];
+		dispatch_async(dispatch_get_main_queue(), ^(void) {
+			NSArray<NSURL*>* urls = self->_pendingURLs;
+			self->_pendingURLs = nil;
+			[self openFilesAtURLs:urls];
+		});
+	}
+	[_pendingURLs addObject:url];
+	completionHandler(nil, NO, nil);
+}
+
+- (void) openFilesAtURLs:(NSArray<NSURL*>*)urls {
+	os_log(open_log(), "Opening %{public}@", urls);
+	NSMutableArray<NSURL*>* files = [NSMutableArray array];
+	BOOL requested = NO;
+	for (NSURL* url in urls) {
+		if ([url.pathExtension isEqualToString:kRequestExtension]) {
+			[self openRequestAtURL:url];
+			requested = YES;
+		} else {
+			[files addObject:url];
+		}
+	}
+	/* With a request, the other files only came along so the sandbox lets the app read them. */
+	if (!requested) [self openComparisonWithURLs:files labels:nil];
+}
+
+/* Open a comparison requested by the diffotron command, and tell it so. */
+- (void) openRequestAtURL:(NSURL*)url {
+	NSError* error = nil;
+	NSData* data = [NSData dataWithContentsOfURL:url options:0 error:&error];
+	NSDictionary* request = data
+		? [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable format:NULL error:&error]
+		: nil;
+	NSString* token = [request isKindOfClass:[NSDictionary class]] ? request[kRequestToken] : nil;
+	if (![token isKindOfClass:[NSString class]]) {
+		os_log_error(open_log(), "Can't read request %{public}@: %{public}@", url.path, error);
+		if (!error) {
+			NSString* reason = [NSString stringWithFormat:@"“%@” isn't a comparison request.", url.lastPathComponent];
+			error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileReadCorruptFileError userInfo:@{NSLocalizedDescriptionKey: reason}];
+		}
+		[self presentError:error];
+		return;
+	}
+
+	NSMutableArray<NSURL*>* urls = [NSMutableArray array];
+	NSArray* paths = request[kRequestPaths];
+	if ([paths isKindOfClass:[NSArray class]]) {
+		for (id path in paths) {
+			if ([path isKindOfClass:[NSString class]]) [urls addObject:[NSURL fileURLWithPath:path]];
+		}
+	}
+	NSArray* labels = request[kRequestLabels];
+	if (![labels isKindOfClass:[NSArray class]]) labels = nil;
+	BOOL wait = [request[kRequestWait] boolValue];
+
+	DiffDocument* doc = urls.count == kSideCount ? [self openComparisonWithURLs:urls labels:labels] : nil;
+	if (doc && wait) doc.closeToken = token;
+	post_request_notification(kOpenedNotification, token);
+	if (!doc && wait) post_request_notification(kClosedNotification, token);
+}
+
 /* Compare the URLs in the frontmost window if it's empty, or else in a new one. */
-- (void) openComparisonWithURLs:(NSArray<NSURL*>*)urls {
-	if (urls.count == 0) return;
+- (DiffDocument*) openComparisonWithURLs:(NSArray<NSURL*>*)urls labels:(NSArray<NSString*>*)labels {
+	if (urls.count == 0) return nil;
 	DiffDocument* doc = nil;
 	NSDocument* current = self.currentDocument;
 	if ([current isKindOfClass:[DiffDocument class]] && [(DiffDocument*)current isEmpty]) {
@@ -1532,11 +1671,12 @@ static id path_url(NSURL* url) {
 		doc = [self openUntitledDocumentAndDisplay:YES error:&error];
 		if (!doc) {
 			if (error) [self presentError:error];
-			return;
+			return nil;
 		}
 	}
-	[doc setURLs:urls];
+	[doc setURLs:urls labels:labels];
 	[doc showWindows];
+	return doc;
 }
 
 @end
@@ -1659,10 +1799,6 @@ static void build_main_menu(NSApplication* app) {
 	return EXIT_SUCCESS;
 }
 
-/* Files and folders opened from the Finder, the Dock, or `open -a`. */
-- (void) application:(NSApplication*)application openURLs:(NSArray<NSURL*>*)urls {
-	[g_document_controller openComparisonWithURLs:urls];
-}
 
 - (BOOL) applicationShouldOpenUntitledFile:(NSApplication*)sender {
 	return YES;

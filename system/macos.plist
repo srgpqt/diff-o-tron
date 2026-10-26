@@ -19,6 +19,18 @@
 				<string>public.folder</string>
 			</array>
 		</dict>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>Comparison Request</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>Owner</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>com.srgpqt.diff-o-tron.request</string>
+			</array>
+		</dict>
 	</array>
 	<key>CFBundleExecutable</key>
 	<string>Diff-o-tron</string>
@@ -48,5 +60,25 @@
 	<string>Copyright © 2026 Serge Paquet. All rights reserved.</string>
 	<key>NSPrincipalClass</key>
 	<string>NSApplication</string>
+	<key>UTExportedTypeDeclarations</key>
+	<array>
+		<dict>
+			<key>UTTypeIdentifier</key>
+			<string>com.srgpqt.diff-o-tron.request</string>
+			<key>UTTypeDescription</key>
+			<string>Diff-o-tron Comparison Request</string>
+			<key>UTTypeConformsTo</key>
+			<array>
+				<string>com.apple.property-list</string>
+			</array>
+			<key>UTTypeTagSpecification</key>
+			<dict>
+				<key>public.filename-extension</key>
+				<array>
+					<string>diffotron-request</string>
+				</array>
+			</dict>
+		</dict>
+	</array>
 </dict>
 </plist>

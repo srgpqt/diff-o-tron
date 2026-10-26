@@ -20,14 +20,8 @@ pub struct Text {
 }
 
 impl Text {
-    /// Load a file. A symlink is read as its target path, as git does.
     pub fn load(path: &Path) -> io::Result<Text> {
-        let meta = fs::symlink_metadata(path)?;
-        if meta.file_type().is_symlink() {
-            let target = fs::read_link(path)?;
-            return Ok(Text::from_bytes(target.to_string_lossy().into_owned().into_bytes()));
-        }
-        Ok(Text::from_bytes(fs::read(path)?))
+        Ok(Text::from_bytes(read_contents(path)?))
     }
 
     pub fn from_bytes(bytes: Vec<u8>) -> Text {
@@ -68,6 +62,16 @@ impl Text {
     pub fn same_contents(&self, other: &Text) -> bool {
         self.binary == other.binary && self.content == other.content && self.bytes == other.bytes
     }
+}
+
+/// The contents of a file. A symlink to a file is followed, like diff(1); any other symlink, to a
+/// directory or to nothing, reads as its target path, as git shows it.
+pub fn read_contents(path: &Path) -> io::Result<Vec<u8>> {
+    let meta = fs::symlink_metadata(path)?;
+    if meta.file_type().is_symlink() && !fs::metadata(path).is_ok_and(|m| m.is_file()) {
+        return Ok(fs::read_link(path)?.to_string_lossy().into_owned().into_bytes());
+    }
+    fs::read(path)
 }
 
 /// The display width of a line in columns, expanding tabs to `tab_width` stops.
@@ -111,6 +115,22 @@ mod tests {
     fn decodes_non_utf8_as_latin1() {
         let t = Text::from_bytes(vec![b'c', b'a', b'f', 0xe9]);
         assert_eq!(t.line(0), "café");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn follows_symlinks_to_files() {
+        let dir = std::env::temp_dir().join(format!("diffotron-text-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("file"), "contents").unwrap();
+        std::os::unix::fs::symlink(dir.join("file"), dir.join("to-file")).unwrap();
+        std::os::unix::fs::symlink(&dir, dir.join("to-dir")).unwrap();
+        std::os::unix::fs::symlink("nowhere", dir.join("dangling")).unwrap();
+        assert_eq!(read_contents(&dir.join("to-file")).unwrap(), b"contents");
+        assert_eq!(read_contents(&dir.join("to-dir")).unwrap(), dir.to_string_lossy().as_bytes());
+        assert_eq!(read_contents(&dir.join("dangling")).unwrap(), b"nowhere");
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

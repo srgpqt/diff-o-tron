@@ -96,7 +96,8 @@ typedef struct {
 /*
  * Compare two paths, each a file or a directory, given as NUL-terminated UTF-8.
  * Directories are walked recursively; a file compared with a directory is
- * compared with the directory's file of the same name. Never returns NULL.
+ * compared with the directory's file of the same name. Symlinks to files are
+ * followed, and /dev/null compares as a missing file. Never returns NULL.
  */
 DtComparison *dt_comparison_new(const char *path_a, const char *path_b);
 void dt_comparison_free(DtComparison *cmp);

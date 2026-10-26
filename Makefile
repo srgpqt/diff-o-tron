@@ -126,6 +126,8 @@ $(RUST_LIB): FORCE
 MACOS_MIN  := 11.0
 
 MACOS_SIGN ?= -
+# Registers the app's file types with Launch Services, which otherwise can go on using stale ones.
+LSREGISTER := /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister
 
 ifeq ($(PLATFORM),macos)
   # Build the Rust objects for the same macOS as the app.
@@ -145,6 +147,8 @@ MACOS_FLAGS := -target arm64-apple-macos$(MACOS_MIN) -isysroot $(MACOS_SDK)
 
 APP                := $(BUILD)/$(APP_NAME).app
 MACOS_BIN          := $(APP)/Contents/MacOS/$(APP_NAME)
+# The diffotron command, for git difftool. Not sandboxed: it only hands files to the app.
+MACOS_CLI          := $(APP)/Contents/Helpers/diffotron
 MACOS_ENTITLEMENTS := entitlements/macos-$(if $(filter release,$(CONFIG)),dist,debug).xml
 ifeq ($(CONFIG),release)
   MACOS_SIGN_ARGS := --options runtime --timestamp
@@ -162,6 +166,14 @@ $(MACOS_BIN): $(BUILD)/macos.o $(RUST_LIB)
 	@mkdir -p $(@D)
 	$(MACOS_CC) $(MACOS_FLAGS) $(MACOS_LDFLAGS) -o $@ $^ -framework Cocoa -framework CoreText $(RUST_LIBS_macos)
 
+$(BUILD)/macos-cli.o: system/macos-cli.m
+	@mkdir -p $(@D)
+	$(MACOS_CC) $(MACOS_FLAGS) $(CFLAGS) -fobjc-arc -MMD -MP -c -o $@ $<
+
+$(MACOS_CLI): $(BUILD)/macos-cli.o
+	@mkdir -p $(@D)
+	$(MACOS_CC) $(MACOS_FLAGS) $(MACOS_LDFLAGS) -o $@ $^ -framework Cocoa
+
 $(APP)/Contents/Info.plist: system/macos.plist Makefile
 	@mkdir -p $(@D)
 	sed -e 's/@APP_VERSION@/$(APP_VERSION)/' -e 's/@APP_BUILD@/$(APP_BUILD)/' -e 's/@MACOS_MIN@/$(MACOS_MIN)/' $< > $@
@@ -170,9 +182,12 @@ $(APP)/Contents/PkgInfo:
 	@mkdir -p $(@D)
 	printf 'APPL????' > $@
 
-$(BUILD)/macos.signed: $(MACOS_BIN) $(APP)/Contents/Info.plist $(APP)/Contents/PkgInfo $(MACOS_ENTITLEMENTS)
+# Nested code first: signing the app seals in the helper's signature.
+$(BUILD)/macos.signed: $(MACOS_BIN) $(MACOS_CLI) $(APP)/Contents/Info.plist $(APP)/Contents/PkgInfo $(MACOS_ENTITLEMENTS)
 ifeq ($(HOST_PLATFORM),macos)
+	codesign --force --sign "$(MACOS_SIGN)" $(MACOS_SIGN_ARGS) $(MACOS_CLI)
 	codesign --force --sign "$(MACOS_SIGN)" --entitlements $(MACOS_ENTITLEMENTS) $(MACOS_SIGN_ARGS) $(APP)
+	$(LSREGISTER) -f $(APP)
 else
 	@echo "Not signing $(APP): codesign needs macOS"
 endif

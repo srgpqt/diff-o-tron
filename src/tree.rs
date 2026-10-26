@@ -3,8 +3,13 @@ use std::ffi::OsString;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use crate::text::read_contents;
+
 /// Names never compared when walking directories.
 const IGNORED_NAMES: &[&str] = &[".git", ".hg", ".svn", ".DS_Store"];
+
+/// Compared as a missing file, as git passes it for added and deleted files.
+const NULL_DEVICE: &str = "/dev/null";
 
 #[repr(u8)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -88,9 +93,16 @@ impl Comparison {
         match (ka, kb) {
             (true, true) => cmp.walk(Some(a), Some(b), ""),
             (false, false) => {
+                let present = |p: &Path| (p != Path::new(NULL_DEVICE)).then(|| p.to_path_buf());
+                let (pa, pb) = (present(a), present(b));
                 let (na, nb) = (name(a), name(b));
-                let path = if na == nb { na } else { format!("{na} → {nb}") };
-                cmp.push(path, Some(a.to_path_buf()), Some(b.to_path_buf()));
+                let path = match (&pa, &pb) {
+                    (None, _) => nb,
+                    (_, None) => na,
+                    _ if na == nb => na,
+                    _ => format!("{na} → {nb}"),
+                };
+                cmp.push(path, pa, pb);
             }
             // Like diff(1): compare the file with the file of the same name in the directory.
             (false, true) => {
@@ -169,16 +181,15 @@ fn compare_names(x: &OsString, y: &OsString) -> Ordering {
 }
 
 fn same_contents(a: &Path, b: &Path) -> bool {
-    let (Ok(ma), Ok(mb)) = (fs::symlink_metadata(a), fs::symlink_metadata(b)) else { return false };
-    match (ma.file_type().is_symlink(), mb.file_type().is_symlink()) {
-        (true, true) => fs::read_link(a).ok() == fs::read_link(b).ok(),
-        (false, false) => {
-            ma.len() == mb.len()
-                && match (fs::read(a), fs::read(b)) {
-                    (Ok(a), Ok(b)) => a == b,
-                    _ => false,
-                }
-        }
+    if let (Ok(ma), Ok(mb)) = (fs::metadata(a), fs::metadata(b))
+        && ma.is_file()
+        && mb.is_file()
+        && ma.len() != mb.len()
+    {
+        return false;
+    }
+    match (read_contents(a), read_contents(b)) {
+        (Ok(a), Ok(b)) => a == b,
         _ => false,
     }
 }
@@ -258,6 +269,26 @@ mod tests {
         let b = TempTree::new(&[("x/y", "2")]);
         let cmp = Comparison::new(&a.0, &b.0);
         assert_eq!(summary(&cmp), [("x", Status::Removed), ("x/y", Status::Added)]);
+    }
+
+    #[test]
+    fn null_device_is_a_missing_file() {
+        let t = TempTree::new(&[("new.txt", "1")]);
+        let cmp = Comparison::new(Path::new(NULL_DEVICE), &t.0.join("new.txt"));
+        assert_eq!(summary(&cmp), [("new.txt", Status::Added)]);
+        let cmp = Comparison::new(&t.0.join("new.txt"), Path::new(NULL_DEVICE));
+        assert_eq!(summary(&cmp), [("new.txt", Status::Removed)]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn follows_symlinks_to_files() {
+        // As `git difftool --dir-diff` makes for working tree files.
+        let a = TempTree::new(&[("f.txt", "1")]);
+        let b = TempTree::new(&[("real/f.txt", "1")]);
+        std::os::unix::fs::symlink(b.0.join("real/f.txt"), b.0.join("f.txt")).unwrap();
+        let cmp = Comparison::new(&a.0, &b.0);
+        assert_eq!(summary(&cmp), [("f.txt", Status::Same), ("real/f.txt", Status::Added)]);
     }
 
     #[test]
