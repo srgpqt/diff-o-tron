@@ -4,6 +4,7 @@
 #   make CONFIG=release      build it optimized
 #   make run [ARGS="a b"]    build and launch it, optionally comparing a and b
 #   make test                run the Rust tests and the C interface test
+#   make icon                regenerate macOS/AppIcon.icns from Assets/AppIcon.svg (on macOS)
 #   make clean
 #
 # PLATFORM=macos|windows|linux overrides the host platform, and RUST_TARGET the target triple,
@@ -181,13 +182,17 @@ $(APP)/Contents/Resources/Credits.html: macOS/credits.html
 	@mkdir -p $(@D)
 	cp $< $@
 
+$(APP)/Contents/Resources/AppIcon.icns: macOS/AppIcon.icns
+	@mkdir -p $(@D)
+	cp $< $@
+
 $(APP)/Contents/PkgInfo:
 	@mkdir -p $(@D)
 	printf 'APPL????' > $@
 
 # Nested code first: signing the app seals in the helper's signature.
 $(BUILD)/macos.signed: $(MACOS_BIN) $(MACOS_CLI) $(APP)/Contents/Info.plist $(APP)/Contents/PkgInfo \
-		$(APP)/Contents/Resources/Credits.html $(MACOS_ENTITLEMENTS)
+		$(APP)/Contents/Resources/Credits.html $(APP)/Contents/Resources/AppIcon.icns $(MACOS_ENTITLEMENTS)
 ifeq ($(HOST_PLATFORM),macos)
 	codesign --force --sign "$(MACOS_SIGN)" $(MACOS_SIGN_ARGS) $(MACOS_CLI)
 	codesign --force --sign "$(MACOS_SIGN)" --entitlements $(MACOS_ENTITLEMENTS) $(MACOS_SIGN_ARGS) $(APP)
@@ -199,6 +204,18 @@ endif
 
 run-macos: macos
 	open -W -a "$(abspath $(APP))" $(ARGS)
+
+# Regenerate macOS/AppIcon.icns from Assets/AppIcon.svg, which is drawn on the macOS icon grid.
+# Needs macOS for iconutil, and rsvg-convert (`brew install librsvg`).
+ICONSET := _build/AppIcon.iconset
+
+icon:
+	rm -rf $(ICONSET) && mkdir -p $(ICONSET)
+	for size in 16 32 128 256 512; do \
+		rsvg-convert -w $$size -h $$size Assets/AppIcon.svg -o $(ICONSET)/icon_$${size}x$${size}.png && \
+		rsvg-convert -w $$((size * 2)) -h $$((size * 2)) Assets/AppIcon.svg -o $(ICONSET)/icon_$${size}x$${size}@2x.png || exit 1; \
+	done
+	iconutil -c icns -o macOS/AppIcon.icns $(ICONSET)
 
 # --- Windows -----------------------------------------------------------------
 
@@ -312,7 +329,7 @@ clean:
 	rm -rf _build
 
 .DEFAULT_GOAL := all
-.PHONY: all run test check-credits clean macos run-macos windows run-windows linux run-linux FORCE
+.PHONY: all run test check-credits clean icon macos run-macos windows run-windows linux run-linux FORCE
 FORCE:
 
 -include $(wildcard $(BUILD)/*.d $(BUILD)/*/*.d $(HOST_BUILD)/*.d)
