@@ -1,0 +1,3 @@
+[submodule "vendor/delta"]
+	path = vendor/delta
+	url = https://github.com/dandavison/delta.git
