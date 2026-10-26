@@ -18,6 +18,10 @@ static NSString* const kComparisonType = @"Comparison";
 /* User defaults: the DiffView mode new windows start in, and whether they wrap lines. */
 static NSString* const kDiffModeDefault = @"DiffMode";
 static NSString* const kWrapLinesDefault = @"WrapLines";
+/* User defaults: the frame of the comparison window last moved or resized, where new ones open. */
+static NSString* const kWindowFrameDefault = @"WindowFrame";
+/* How far a new window is moved off a window already where it would open. */
+static const CGFloat kCascadeOffset = 22;
 
 /* The number of compared sides; a merge will add a base and a result. */
 static const NSUInteger kSideCount = 2;
@@ -2141,9 +2145,45 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	[window layoutIfNeeded];
 	[_split.splitView setPosition:260 ofDividerAtIndex:0];
 	[window center];
+	[self restoreWindowFrame];
 	window.initialFirstResponder = _table;
 
 	[self updateChangeLabel];
+}
+
+/* Open where the last comparison window was, moved off any window already there. */
+- (void) restoreWindowFrame {
+	NSWindow* window = self.window;
+	NSString* frame = [[NSUserDefaults standardUserDefaults] stringForKey:kWindowFrameDefault];
+	if (frame) [window setFrameFromString:frame];
+
+	BOOL covered = YES;
+	for (int tries = 0; covered && tries < 20; tries++) {
+		covered = NO;
+		for (NSWindow* other in NSApp.windows) {
+			if (other == window || !other.visible || ![other.delegate isKindOfClass:[DiffWindowController class]]) continue;
+			if (fabs(NSMinX(other.frame) - NSMinX(window.frame)) < 1 && fabs(NSMaxY(other.frame) - NSMaxY(window.frame)) < 1) {
+				covered = YES;
+			}
+		}
+		if (covered) {
+			[window setFrameTopLeftPoint:NSMakePoint(NSMinX(window.frame) + kCascadeOffset, NSMaxY(window.frame) - kCascadeOffset)];
+		}
+	}
+}
+
+- (void) saveWindowFrame {
+	NSWindow* window = self.window;
+	if (!window.visible || (window.styleMask & NSWindowStyleMaskFullScreen)) return;
+	[[NSUserDefaults standardUserDefaults] setObject:window.stringWithSavedFrame forKey:kWindowFrameDefault];
+}
+
+- (void) windowDidMove:(NSNotification*)notification {
+	[self saveWindowFrame];
+}
+
+- (void) windowDidResize:(NSNotification*)notification {
+	[self saveWindowFrame];
 }
 
 #pragma mark Document state
