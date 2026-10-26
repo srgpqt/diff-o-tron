@@ -77,25 +77,33 @@ static NSColor* dynamic_color(uint32_t light, uint32_t dark) {
 
 /* Indexed by DtLine.kind. */
 static NSColor* g_line_colors[4];
+/* For the lines of the current hunk. */
+static NSColor* g_current_line_colors[4];
 static NSColor* g_emphasis_colors[4];
 static NSColor* g_edge_colors[4];
 static NSColor* g_filler_color;
 static NSColor* g_middle_color;
-static NSColor* g_current_color;
 
 static void init_colors(void) {
 	g_line_colors[DT_LINE_CHANGED] = dynamic_color(0xECE8FD, 0x37324F);
 	g_line_colors[DT_LINE_REMOVED] = dynamic_color(0xFCE6E6, 0x432729);
 	g_line_colors[DT_LINE_ADDED] = dynamic_color(0xE3F5DC, 0x253A26);
-	g_emphasis_colors[DT_LINE_CHANGED] = dynamic_color(0xCDC3F8, 0x55488F);
-	g_emphasis_colors[DT_LINE_REMOVED] = dynamic_color(0xF5BDBD, 0x74393F);
-	g_emphasis_colors[DT_LINE_ADDED] = dynamic_color(0xB9E6A8, 0x37663A);
+	g_current_line_colors[DT_LINE_CHANGED] = dynamic_color(0xDED7FB, 0x433C62);
+	g_current_line_colors[DT_LINE_REMOVED] = dynamic_color(0xF8D5D5, 0x552F32);
+	g_current_line_colors[DT_LINE_ADDED] = dynamic_color(0xD2EDC8, 0x2D4830);
+	g_emphasis_colors[DT_LINE_CHANGED] = dynamic_color(0xC6BAF6, 0x5D50A0);
+	g_emphasis_colors[DT_LINE_REMOVED] = dynamic_color(0xF1B3B3, 0x7A3C43);
+	g_emphasis_colors[DT_LINE_ADDED] = dynamic_color(0xB2E2A0, 0x3D6E40);
 	g_edge_colors[DT_LINE_CHANGED] = dynamic_color(0x9A8AE8, 0x7D6BD6);
 	g_edge_colors[DT_LINE_REMOVED] = dynamic_color(0xE08080, 0xB0545C);
 	g_edge_colors[DT_LINE_ADDED] = dynamic_color(0x7CC46A, 0x4F9A55);
 	g_filler_color = dynamic_color(0xF4F4F6, 0x262628);
 	g_middle_color = dynamic_color(0xF7F7F9, 0x232325);
-	g_current_color = dynamic_color(0x8D7BEA, 0x6E5CCB);
+}
+
+/* The background of a changed line, or the band joining a hunk across sides. */
+static NSColor* line_color(uint8_t kind, BOOL inCurrentHunk) {
+	return inCurrentHunk ? g_current_line_colors[kind] : g_line_colors[kind];
 }
 
 static uint8_t hunk_kind(DtHunk hunk) {
@@ -252,7 +260,7 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	/* Core Text attributes, so drawing and hit testing share one layout. */
 	@property (nonatomic, readonly) NSDictionary* textAttributes;
 	@property (nonatomic, readonly) NSDictionary* numberAttributes;
-	@property (nonatomic, readonly) NSDictionary* currentNumberAttributes;
+
 	@property (nonatomic, readonly) CGFloat lineHeight;
 	@property (nonatomic, readonly) CGFloat fontLineHeight;
 	@property (nonatomic, readonly) CGFloat textInset;
@@ -471,10 +479,6 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 		NSFontAttributeName: numberFont,
 		NSForegroundColorAttributeName: [NSColor secondaryLabelColor]
 	};
-	_currentNumberAttributes = @{
-		NSFontAttributeName: numberFont,
-		NSForegroundColorAttributeName: [NSColor whiteColor]
-	};
 
 	[self updateGutterWidth];
 	for (DiffPaneView* pane in _panes) [pane relayout];
@@ -591,7 +595,7 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 		if (bottom < NSMinY(dirty) - 1 || top > NSMaxY(dirty) + 1) continue;
 		uint8_t kind = hunk_kind(hunk);
 		if (bands) {
-			[g_line_colors[kind] setFill];
+			[line_color(kind, (NSInteger)i == _currentHunk) setFill];
 			NSRectFill(NSMakeRect(NSMinX(dirty), top, NSWidth(dirty), bottom - top));
 		}
 		[g_edge_colors[kind] setFill];
@@ -810,9 +814,9 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 				NSRect frame = NSMakeRect((CGFloat)side * column, [owner rowY:row] - offset, column, owner.lineHeight);
 				[self drawLine:line side:side frame:frame current:current];
 				if (groupStart) {
-					NSDictionary* attributes = current ? owner.currentNumberAttributes : owner.numberAttributes;
 					NSString* letter = side == 0 ? @"A" : @"B";
-					[letter drawAtPoint:NSMakePoint(NSMinX(frame) + 4, NSMinY(frame) + owner.textInset) withAttributes:attributes];
+					NSPoint point = NSMakePoint(NSMinX(frame) + 4, NSMinY(frame) + owner.textInset);
+					[letter drawAtPoint:point withAttributes:owner.numberAttributes];
 				}
 			}
 		}
@@ -841,7 +845,7 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	[owner drawHunksInRect:dirty offset:offset bands:NO];
 }
 
-/* A line's number, or filler for none; highlighted if changed in the current hunk. */
+/* A line's number, or filler for none, on the line's background. */
 - (void) drawLine:(int32_t)lineIndex side:(NSUInteger)side frame:(NSRect)frame current:(BOOL)inCurrentHunk {
 	if (lineIndex < 0) {
 		[g_filler_color setFill];
@@ -851,13 +855,11 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 
 	DiffView* owner = _owner;
 	DtLine line = dt_file_diff_line(owner.diff, (uint8_t)side, (size_t)lineIndex);
-	BOOL changed = line.kind != DT_LINE_EQUAL && line.kind < 4;
-	BOOL current = changed && inCurrentHunk;
-	if (changed) {
-		[(current ? g_current_color : g_line_colors[line.kind]) setFill];
+	if (line.kind != DT_LINE_EQUAL && line.kind < 4) {
+		[line_color(line.kind, inCurrentHunk) setFill];
 		NSRectFill(frame);
 	}
-	NSDictionary* attributes = current ? owner.currentNumberAttributes : owner.numberAttributes;
+	NSDictionary* attributes = owner.numberAttributes;
 	NSString* number = [NSString stringWithFormat:@"%ld", (long)lineIndex + 1];
 	NSSize size = [number sizeWithAttributes:attributes];
 	NSPoint point = NSMakePoint(NSMaxX(frame) - kGutterPadding - size.width, NSMinY(frame) + owner.textInset);
@@ -918,7 +920,7 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 		[band lineToPoint:NSMakePoint(width, nextBottom)];
 		[band lineToPoint:NSMakePoint(0, bottom)];
 		[band closePath];
-		[g_line_colors[kind] setFill];
+		[line_color(kind, (NSInteger)i == owner.currentHunk) setFill];
 		[band fill];
 
 		/* Edges along the hunks' outlines: the top's first pixel row, the bottom's last. */
@@ -1089,7 +1091,8 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 			size_t line;
 			if (![owner unifiedRow:row side:&side line:&line]) continue;
 			NSRect frame = NSMakeRect(0, [owner rowY:row], width, owner.lineHeight);
-			[self drawLine:(int32_t)line side:side selectionLine:(NSInteger)row frame:frame];
+			BOOL current = [owner unifiedRowInCurrentHunk:row];
+			[self drawLine:(int32_t)line side:side selectionLine:(NSInteger)row frame:frame current:current];
 		}
 		[owner drawUnifiedGroupsFrom:first to:last inRect:dirty offset:0];
 		return;
@@ -1100,7 +1103,8 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 		[owner linesFrom:NSMinY(dirty) + shift to:NSMaxY(dirty) + shift side:_side first:&first last:&last];
 		for (size_t line = first; line < last; line++) {
 			NSRect frame = NSMakeRect(0, [owner rowY:line] - shift, width, owner.lineHeight);
-			[self drawLine:(int32_t)line side:_side selectionLine:(NSInteger)line frame:frame];
+			BOOL current = [owner lineInCurrentHunk:line side:_side];
+			[self drawLine:(int32_t)line side:_side selectionLine:(NSInteger)line frame:frame current:current];
 		}
 		[owner drawSideHunks:_side inRect:dirty offset:shift];
 		return;
@@ -1110,13 +1114,13 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	for (size_t row = first; row < last; row++) {
 		NSRect frame = NSMakeRect(0, [owner rowY:row], width, owner.lineHeight);
 		int32_t line = dt_file_diff_row_line(owner.diff, row, (uint8_t)_side);
-		[self drawLine:line side:_side selectionLine:line frame:frame];
+		[self drawLine:line side:_side selectionLine:line frame:frame current:[owner rowInCurrentHunk:row]];
 	}
 	[owner drawHunksInRect:dirty offset:0 bands:NO];
 }
 
 /* A side's line, or filler for none. selectionLine is where the selection has it. */
-- (void) drawLine:(int32_t)lineIndex side:(NSUInteger)side selectionLine:(NSInteger)selectionLine frame:(NSRect)frame {
+- (void) drawLine:(int32_t)lineIndex side:(NSUInteger)side selectionLine:(NSInteger)selectionLine frame:(NSRect)frame current:(BOOL)inCurrentHunk {
 	if (lineIndex < 0) {
 		[g_filler_color setFill];
 		NSRectFill(frame);
@@ -1127,7 +1131,7 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	DtLine line = dt_file_diff_line(owner.diff, (uint8_t)side, (size_t)lineIndex);
 	BOOL changed = line.kind != DT_LINE_EQUAL && line.kind < 4;
 	if (changed) {
-		[g_line_colors[line.kind] setFill];
+		[line_color(line.kind, inCurrentHunk) setFill];
 		NSRectFill(frame);
 	}
 
