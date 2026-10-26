@@ -178,12 +178,17 @@ $(APP)/Contents/Info.plist: system/macos.plist Makefile
 	@mkdir -p $(@D)
 	sed -e 's/@APP_VERSION@/$(APP_VERSION)/' -e 's/@APP_BUILD@/$(APP_BUILD)/' -e 's/@MACOS_MIN@/$(MACOS_MIN)/' $< > $@
 
+$(APP)/Contents/Resources/Credits.html: system/credits.html
+	@mkdir -p $(@D)
+	cp $< $@
+
 $(APP)/Contents/PkgInfo:
 	@mkdir -p $(@D)
 	printf 'APPL????' > $@
 
 # Nested code first: signing the app seals in the helper's signature.
-$(BUILD)/macos.signed: $(MACOS_BIN) $(MACOS_CLI) $(APP)/Contents/Info.plist $(APP)/Contents/PkgInfo $(MACOS_ENTITLEMENTS)
+$(BUILD)/macos.signed: $(MACOS_BIN) $(MACOS_CLI) $(APP)/Contents/Info.plist $(APP)/Contents/PkgInfo \
+		$(APP)/Contents/Resources/Credits.html $(MACOS_ENTITLEMENTS)
 ifeq ($(HOST_PLATFORM),macos)
 	codesign --force --sign "$(MACOS_SIGN)" $(MACOS_SIGN_ARGS) $(MACOS_CLI)
 	codesign --force --sign "$(MACOS_SIGN)" --entitlements $(MACOS_ENTITLEMENTS) $(MACOS_SIGN_ARGS) $(APP)
@@ -279,10 +284,19 @@ HOST_CC_macos := xcrun clang
 HOST_CC_linux := clang
 FFI_TEST      := $(HOST_BUILD)/ffi-test
 
-test: $(FFI_TEST)
+test: check-credits $(FFI_TEST)
 	$(CARGO) test --target-dir $(CARGO_DIR) --target $(HOST_TARGET)
 	@rm -rf $(HOST_BUILD)/ffi-scratch && mkdir -p $(HOST_BUILD)/ffi-scratch
 	$(FFI_TEST) $(HOST_BUILD)/ffi-scratch
+
+# Every crate linked into the app must be credited in its About panel.
+check-credits:
+	@status=0; \
+	for crate in $$($(CARGO) tree -e normal --prefix none --target all | awk '{ print $$1 }' | sort -u); do \
+		[ "$$crate" = diffotron ] && continue; \
+		grep -q "<h3>$$crate</h3>" system/credits.html || { echo "system/credits.html doesn't credit $$crate"; status=1; }; \
+	done; \
+	exit $$status
 
 # Always built for the host, whatever PLATFORM is.
 $(FFI_TEST): tests/ffi.c FORCE
@@ -299,7 +313,7 @@ clean:
 	rm -rf _build
 
 .DEFAULT_GOAL := all
-.PHONY: all run test clean macos run-macos windows run-windows linux run-linux FORCE
+.PHONY: all run test check-credits clean macos run-macos windows run-windows linux run-linux FORCE
 FORCE:
 
 -include $(wildcard $(BUILD)/*.d $(HOST_BUILD)/*.d)

@@ -1938,7 +1938,7 @@ static void build_main_menu(NSApplication* app) {
 
 	/* App menu */ {
 		NSMenu* appMenu = add_menu(mainMenu, @"Diff-o-tron");
-		[appMenu addItem:_(@"About Diff-o-tron", @selector(orderFrontStandardAboutPanel:), @"")];
+		[appMenu addItem:_(@"About Diff-o-tron", @selector(showAboutPanel:), @"")];
 		[appMenu addItem:[NSMenuItem separatorItem]];
 		[appMenu addItem:_(@"Hide Diff-o-tron", @selector(hide:), @"h")];
 		[appMenu addItem:with_modifiers(_(@"Hide Others", @selector(hideOtherApplications:), @"h"), NSEventModifierFlagCommand | NSEventModifierFlagOption)];
@@ -2029,6 +2029,20 @@ static void build_main_menu(NSApplication* app) {
 - (BOOL) applicationOpenUntitledFile:(NSApplication*)sender {
 	[g_document_controller newDocument:nil];
 	return YES;
+}
+
+/* The standard About panel, with the credits the licenses of the software built in require. */
+- (IBAction) showAboutPanel:(id)sender {
+	NSMutableDictionary* options = [NSMutableDictionary dictionary];
+	NSURL* url = [[NSBundle mainBundle] URLForResource:@"Credits" withExtension:@"html"];
+	NSData* data = url ? [NSData dataWithContentsOfURL:url] : nil;
+	NSMutableAttributedString* credits = data ? [[NSMutableAttributedString alloc] initWithHTML:data documentAttributes:NULL] : nil;
+	if (credits) {
+		/* Text from HTML comes in black; follow the appearance instead. */
+		[credits addAttribute:NSForegroundColorAttributeName value:[NSColor labelColor] range:NSMakeRange(0, credits.length)];
+		options[NSAboutPanelOptionCredits] = credits;
+	}
+	[NSApp orderFrontStandardAboutPanelWithOptions:options];
 }
 
 - (BOOL) applicationSupportsSecureRestorableState:(NSApplication*)application {
