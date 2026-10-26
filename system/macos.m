@@ -174,6 +174,8 @@ enum {
 	/* Called when a click changes currentHunk. */
 	@property (nonatomic, copy) void (^currentHunkChanged)(void);
 	- (void) scrollToCurrentHunk;
+	/* Light up the current hunk for a moment, as when there's no hunk further on to move to. */
+	- (void) flashCurrentHunk;
 @end
 
 /* Shows where a drag will drop; transparent to the mouse. */
@@ -246,6 +248,7 @@ static const CGFloat kMiddleWidth = 40;
 static const CGFloat kGutterPadding = 8;
 static const CGFloat kTextPadding = 8;
 static const CGFloat kUnifiedLetterWidth = 14;
+static const NSTimeInterval kFlashDuration = 0.4;
 
 /* A caret position in one side's text: a line, and a UTF-16 offset into it. */
 typedef struct {
@@ -395,6 +398,8 @@ typedef struct {
 	/* Outline the runs of changed lines in the rows from first up to last, drawn offset up. */
 	- (void) drawUnifiedGroupsFrom:(size_t)first to:(size_t)last inRect:(NSRect)dirty offset:(CGFloat)offset;
 	- (void) selectHunkAtUnifiedRow:(size_t)row;
+	/* While the current hunk is flashing, light up its part of a side in dirty, drawn offset up. */
+	- (void) drawFlashForSide:(NSUInteger)side inRect:(NSRect)dirty offset:(CGFloat)offset;
 	- (void) paneDidSelect:(DiffPaneView*)pane;
 	/* The file shown on a side, or nil. */
 	- (NSURL*) fileURLForSide:(NSUInteger)side;
@@ -441,6 +446,10 @@ typedef struct {
 	/* The width lines are wrapped to, or 0 when they aren't. */
 	CGFloat _wrapWidth;
 	BOOL _layingOut;
+
+	/* How lit up the current hunk is, from 1 when it starts flashing down to 0. */
+	CGFloat _flash;
+	NSTimer* _flashTimer;
 }
 
 + (void) initialize {
@@ -543,6 +552,9 @@ typedef struct {
 	if (diff == _diff) return;
 	dt_file_diff_free(_diff);
 	_diff = diff;
+	[_flashTimer invalidate];
+	_flashTimer = nil;
+	_flash = 0;
 	_currentHunk = diff && dt_file_diff_hunk_count(diff) > 0 ? 0 : -1;
 	_maxLines = 0;
 	_maxColumns = 0;
@@ -1100,6 +1112,58 @@ static NSMutableData* new_tops(size_t count) {
 	}
 }
 
+- (void) flashCurrentHunk {
+	[_flashTimer invalidate];
+	NSTimeInterval start = [NSProcessInfo processInfo].systemUptime;
+	_flash = 1;
+	__weak DiffView* weakSelf = self;
+	_flashTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 / 60 repeats:YES block:^(NSTimer* timer) {
+		DiffView* view = weakSelf;
+		if (!view) {
+			[timer invalidate];
+			return;
+		}
+		/* Fading out fast, then slowly. */
+		CGFloat elapsed = (CGFloat)(([NSProcessInfo processInfo].systemUptime - start) / kFlashDuration);
+		view->_flash = elapsed < 1 ? (1 - elapsed) * (1 - elapsed) : 0;
+		if (elapsed >= 1) {
+			[timer invalidate];
+			view->_flashTimer = nil;
+		}
+		[view redrawAll];
+	}];
+	[self redrawAll];
+}
+
+- (void) drawFlashForSide:(NSUInteger)side inRect:(NSRect)dirty offset:(CGFloat)offset {
+	if (_flash <= 0 || !_diff || _currentHunk < 0 || (size_t)_currentHunk >= dt_file_diff_hunk_count(_diff)) return;
+	DtHunk hunk = dt_file_diff_hunk(_diff, (size_t)_currentHunk);
+	CGFloat top, bottom;
+	if (_mode == kDiffModeUnified) {
+		top = [self unifiedY:hunk.unified_start];
+		bottom = [self unifiedY:hunk.unified_end];
+	} else if (_mode == kDiffModeFluid) {
+		uint32_t start, end;
+		[self hunk:hunk side:side start:&start end:&end];
+		top = [self lineY:start side:side];
+		bottom = [self lineY:end side:side];
+	} else {
+		top = [self rowY:hunk.row_start];
+		bottom = [self rowY:hunk.row_end];
+	}
+	top -= offset;
+	bottom -= offset;
+	/* A hunk with no lines on this side lights up the line where they'd be. */
+	if (bottom - top < 2) {
+		top -= 1;
+		bottom = top + 2;
+	}
+	NSRect rect = NSIntersectionRect(NSMakeRect(NSMinX(dirty), top, NSWidth(dirty), bottom - top), dirty);
+	if (NSIsEmptyRect(rect)) return;
+	[[[NSColor controlAccentColor] colorWithAlphaComponent:0.35 * _flash] setFill];
+	NSRectFillUsingOperation(rect, NSCompositingOperationSourceOver);
+}
+
 /* Scroll the current hunk to a third of the way down, unless it's already in view. */
 - (void) scrollToCurrentHunk {
 	if (!_diff || _currentHunk < 0 || (size_t)_currentHunk >= dt_file_diff_hunk_count(_diff)) return;
@@ -1166,6 +1230,7 @@ static NSMutableData* new_tops(size_t count) {
 			}
 		}
 		[owner drawUnifiedGroupsFrom:first to:last inRect:dirty offset:offset];
+		[owner drawFlashForSide:_side inRect:dirty offset:offset];
 		return;
 	}
 
@@ -1178,6 +1243,7 @@ static NSMutableData* new_tops(size_t count) {
 			[self drawLine:(int32_t)line side:_side frame:frame current:[owner lineInCurrentHunk:line side:_side]];
 		}
 		[owner drawSideHunks:_side inRect:dirty offset:offset];
+		[owner drawFlashForSide:_side inRect:dirty offset:offset];
 		return;
 	}
 
@@ -1190,6 +1256,7 @@ static NSMutableData* new_tops(size_t count) {
 		[self drawLine:line side:_side frame:frame current:[owner rowInCurrentHunk:row]];
 	}
 	[owner drawHunksInRect:dirty offset:offset bands:NO];
+	[owner drawFlashForSide:_side inRect:dirty offset:offset];
 }
 
 /* A line's number, at the top of its frame, or filler for none, on the line's background. */
@@ -1434,6 +1501,7 @@ static NSMutableData* new_tops(size_t count) {
 			[self drawLine:(int32_t)line side:side selectionLine:(NSInteger)row frame:frame current:current];
 		}
 		[owner drawUnifiedGroupsFrom:first to:last inRect:dirty offset:0];
+		[owner drawFlashForSide:_side inRect:dirty offset:0];
 		return;
 	}
 
@@ -1447,6 +1515,7 @@ static NSMutableData* new_tops(size_t count) {
 			[self drawLine:(int32_t)line side:_side selectionLine:(NSInteger)line frame:frame current:current];
 		}
 		[owner drawSideHunks:_side inRect:dirty offset:shift];
+		[owner drawFlashForSide:_side inRect:dirty offset:shift];
 		return;
 	}
 
@@ -1458,6 +1527,7 @@ static NSMutableData* new_tops(size_t count) {
 		[self drawLine:line side:_side selectionLine:line frame:frame current:[owner rowInCurrentHunk:row]];
 	}
 	[owner drawHunksInRect:dirty offset:0 bands:NO];
+	[owner drawFlashForSide:_side inRect:dirty offset:0];
 }
 
 /*
@@ -2528,7 +2598,12 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	DtFileDiff* diff = _diffView.diff;
 	if (!diff) return;
 	NSInteger hunk = _diffView.currentHunk + step;
-	if (hunk < 0 || hunk >= (NSInteger)dt_file_diff_hunk_count(diff)) return;
+	if (hunk < 0 || hunk >= (NSInteger)dt_file_diff_hunk_count(diff)) {
+		/* Nowhere further to go: show where the current hunk is instead. */
+		[_diffView scrollToCurrentHunk];
+		[_diffView flashCurrentHunk];
+		return;
+	}
 	_diffView.currentHunk = hunk;
 	[_diffView scrollToCurrentHunk];
 	[self updateChangeLabel];
@@ -2592,10 +2667,12 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 		menuItem.state = _diffView.mode == kDiffModeFluid ? NSControlStateValueOn : NSControlStateValueOff;
 	} else if (action == @selector(showUnified:)) {
 		menuItem.state = _diffView.mode == kDiffModeUnified ? NSControlStateValueOn : NSControlStateValueOff;
-	} else if (action == @selector(previousChange:)) {
-		return _previousButton.enabled;
-	} else if (action == @selector(nextChange:)) {
-		return _nextButton.enabled;
+	} else if (action == @selector(previousChange:) || action == @selector(nextChange:)) {
+		/*
+		 * Enabled even with no change to move to, so their keys don't fall through
+		 * to the sidebar, which would move to another file: that's for Shift too.
+		 */
+		return _diffView.diff != NULL;
 	} else if (action == @selector(selectPreviousFile:)) {
 		return [self fileRowFrom:_table.selectedRow step:-1] >= 0;
 	} else if (action == @selector(selectNextFile:)) {
