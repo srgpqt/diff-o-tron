@@ -1,8 +1,10 @@
 #import <Cocoa/Cocoa.h>
 #import <CoreText/CoreText.h>
 
+#include <fcntl.h>
 #include <math.h>
 #include <os/log.h>
+#include <unistd.h>
 
 #include "diffotron.h"
 #include "macos-request.h"
@@ -164,6 +166,11 @@ enum {
 @interface DiffView : NSView
 	/* Owned: freed when replaced. */
 	@property (nonatomic) DtFileDiff* diff;
+	/*
+	 * Show a new diff, keeping where the view is scrolled to and the nearest hunk
+	 * current if keep is set, as when the same files are reloaded.
+	 */
+	- (void) setDiff:(DtFileDiff*)diff keepingPosition:(BOOL)keep;
 	@property (nonatomic) NSInteger mode;
 	@property (nonatomic) BOOL wrapsLines;
 	/* The files shown, for their context menus: an NSURL per side, or NSNull for none. */
@@ -196,6 +203,8 @@ enum {
 	@property (nonatomic) BOOL isGroup;
 	@property (nonatomic, copy) NSString* title;
 	@property (nonatomic) size_t entry;
+	/* The entry's path, to find it again in a reloaded comparison. */
+	@property (nonatomic, copy) NSString* path;
 	@property (nonatomic) uint8_t status;
 @end
 
@@ -211,6 +220,8 @@ enum {
 	@property (nonatomic, readonly) BOOL comparing;
 	/* Incremented whenever the comparison is replaced. */
 	@property (nonatomic, readonly) NSUInteger generation;
+	/* Whether the comparison was last replaced by reloading the same files, after they changed. */
+	@property (nonatomic, readonly) BOOL reloaded;
 	/* Posted with kClosedNotification when the document closes. */
 	@property (nonatomic, copy) NSString* closeToken;
 	- (NSURL*) urlForSide:(NSUInteger)side;
@@ -414,7 +425,8 @@ typedef struct {
 @interface DiffPaneView : NSView
 	@property (nonatomic, readonly) NSUInteger side;
 	- (instancetype) initWithOwner:(DiffView*)owner side:(NSUInteger)side;
-	- (void) diffDidChange;
+	/* The diff changed: clear the selection, and scroll to the top if scrollToTop is set. */
+	- (void) diffDidChange:(BOOL)scrollToTop;
 	- (void) modeDidChange;
 	- (void) relayout;
 	- (void) clearSelection;
@@ -554,13 +566,37 @@ typedef struct {
 }
 
 - (void) setDiff:(DtFileDiff*)diff {
+	[self setDiff:diff keepingPosition:NO];
+}
+
+- (void) setDiff:(DtFileDiff*)diff keepingPosition:(BOOL)keep {
 	if (diff == _diff) return;
+	ScrollAnchor anchor = keep ? [self scrollAnchor] : (ScrollAnchor){0, 0, 0, NO};
+	/* Where the current hunk starts, in the current mode's rows, to find the nearest hunk in the new diff. */
+	NSInteger hunkRow = -1;
+	if (keep && _diff && _currentHunk >= 0 && (size_t)_currentHunk < dt_file_diff_hunk_count(_diff)) {
+		DtHunk hunk = dt_file_diff_hunk(_diff, (size_t)_currentHunk);
+		hunkRow = _mode == kDiffModeUnified ? hunk.unified_start : hunk.row_start;
+	}
+
 	dt_file_diff_free(_diff);
 	_diff = diff;
 	[_flashTimer invalidate];
 	_flashTimer = nil;
 	_flash = 0;
 	_currentHunk = diff && dt_file_diff_hunk_count(diff) > 0 ? 0 : -1;
+	if (hunkRow >= 0 && _currentHunk >= 0) {
+		/* The first hunk that doesn't end before it, or else the last. */
+		size_t count = dt_file_diff_hunk_count(diff);
+		_currentHunk = (NSInteger)count - 1;
+		for (size_t i = 0; i < count; i++) {
+			DtHunk hunk = dt_file_diff_hunk(diff, i);
+			if ((NSInteger)(_mode == kDiffModeUnified ? hunk.unified_end : hunk.row_end) > hunkRow) {
+				_currentHunk = (NSInteger)i;
+				break;
+			}
+		}
+	}
 	_maxLines = 0;
 	_maxColumns = 0;
 	for (NSUInteger side = 0; diff && side < kSideCount; side++) {
@@ -573,7 +609,8 @@ typedef struct {
 	}
 	[self updateGutterWidth];
 	[self layoutLines];
-	for (DiffPaneView* pane in _panes) [pane diffDidChange];
+	for (DiffPaneView* pane in _panes) [pane diffDidChange:!keep];
+	[self restoreScrollAnchor:anchor];
 	[self redrawAll];
 }
 
@@ -1432,7 +1469,7 @@ static NSMutableData* new_tops(size_t count) {
 	if ([self hasSelection]) [self setNeedsDisplay:YES];
 }
 
-- (void) diffDidChange {
+- (void) diffDidChange:(BOOL)scrollToTop {
 	DtFileDiff* diff = _owner.diff;
 	_anchor = kNoPosition;
 	_head = kNoPosition;
@@ -1443,7 +1480,7 @@ static NSMutableData* new_tops(size_t count) {
 		if (columns > _maxColumns) _maxColumns = columns;
 	}
 	[self relayout];
-	[self scrollPoint:NSZeroPoint];
+	if (scrollToTop) [self scrollPoint:NSZeroPoint];
 	[self setNeedsDisplay:YES];
 }
 
@@ -2039,6 +2076,7 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	NSMutableArray<SidebarItem*>* _items;
 	NSUInteger _shownGeneration;
 	NSInteger _shownEntry;
+	NSString* _shownPath;
 	/* Shown instead of the diff, such as for binary files. */
 	NSString* _fileMessage;
 	BOOL _ignoreWhitespace;
@@ -2291,7 +2329,7 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	DiffDocument* doc = [self diffDocument];
 	if (doc.generation != _shownGeneration) {
 		_shownGeneration = doc.generation;
-		[self reloadItems];
+		[self reloadItemsKeepingSelection:doc.reloaded];
 	}
 	[self updateSidebarTitle];
 	[self updatePaneTitles];
@@ -2303,7 +2341,12 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 	if (document) [self documentDidChange];
 }
 
-- (void) reloadItems {
+/*
+ * List the comparison's files and show the first. When it's reloaded, keep
+ * showing the same file, if it's still there, where it was.
+ */
+- (void) reloadItemsKeepingSelection:(BOOL)keep {
+	NSString* shownPath = keep ? _shownPath : nil;
 	[_items removeAllObjects];
 	DiffDocument* doc = [self diffDocument];
 	DtComparison* cmp = doc.comparison;
@@ -2332,17 +2375,23 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 			item.title = [a isEqualToString:b] ? a : [NSString stringWithFormat:@"%@ → %@", a, b];
 		}
 		item.entry = i;
+		item.path = dt_string(entry.path);
 		item.status = entry.status;
 		[_items addObject:item];
 	}
 	[_table reloadData];
 
-	NSInteger first = [self fileRowFrom:-1 step:1];
-	if (first >= 0) {
-		[_table selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)first] byExtendingSelection:NO];
-		[_table scrollRowToVisible:first];
+	NSInteger row = -1;
+	for (NSUInteger i = 0; shownPath && i < _items.count; i++) {
+		if (!_items[i].isGroup && [_items[i].path isEqualToString:shownPath]) row = (NSInteger)i;
 	}
-	[self showSelectedEntry:YES];
+	BOOL same = row >= 0;
+	if (!same) row = [self fileRowFrom:-1 step:1];
+	if (row >= 0) {
+		[_table selectRowIndexes:[NSIndexSet indexSetWithIndex:(NSUInteger)row] byExtendingSelection:NO];
+		[_table scrollRowToVisible:row];
+	}
+	[self showSelectedEntry:YES keepingPosition:same];
 }
 
 - (void) updateSidebarTitle {
@@ -2460,14 +2509,22 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 
 /* Show the selected file's diff, unless it's already shown and force is NO. */
 - (void) showSelectedEntry:(BOOL)force {
+	[self showSelectedEntry:force keepingPosition:NO];
+}
+
+/* keep: keep the diff where it's scrolled to, as when the same file is shown again. */
+- (void) showSelectedEntry:(BOOL)force keepingPosition:(BOOL)keep {
 	NSInteger row = _table.selectedRow;
 	NSInteger entry = -1;
+	NSString* entryPath = nil;
 	if (row >= 0 && (NSUInteger)row < _items.count && !_items[(NSUInteger)row].isGroup) {
 		entry = (NSInteger)_items[(NSUInteger)row].entry;
+		entryPath = _items[(NSUInteger)row].path;
 	}
 	if (entry == _shownEntry && !force) return;
 
 	_shownEntry = entry;
+	_shownPath = entryPath;
 	_fileMessage = nil;
 	DtComparison* cmp = [self diffDocument].comparison;
 	DtFileDiff* diff = NULL;
@@ -2487,8 +2544,8 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 		[files addObject:path.length > 0 ? (id)[NSURL fileURLWithPath:path] : [NSNull null]];
 	}
 	_diffView.fileURLs = files;
-	_diffView.diff = diff;
-	[_diffView scrollToCurrentHunk];
+	[_diffView setDiff:diff keepingPosition:keep];
+	if (!keep) [_diffView scrollToCurrentHunk];
 
 	[self updatePaneTitles];
 	[self updateChangeLabel];
@@ -2699,6 +2756,128 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 
 @end
 
+#pragma mark - PathWatcher
+
+/* How long to gather changes on disk for before reloading. */
+static const NSTimeInterval kReloadDelay = 0.3;
+/* How often to look for a watched file that's gone, such as while it's being saved. */
+static const NSTimeInterval kRewatchDelay = 1;
+
+static BOOL is_directory(NSURL* url) {
+	NSNumber* directory = nil;
+	[url getResourceValue:&directory forKey:NSURLIsDirectoryKey error:NULL];
+	return directory.boolValue;
+}
+
+/* Calls a block when a file, or anything in a folder, changes on disk. */
+@interface PathWatcher : NSObject
+	- (instancetype) initWithURL:(NSURL*)url handler:(void (^)(void))handler;
+	- (void) stop;
+@end
+
+@implementation PathWatcher {
+	NSURL* _url;
+	void (^_handler)(void);
+	FSEventStreamRef _stream;
+	dispatch_source_t _source;
+	BOOL _stopped;
+}
+
+static void folder_did_change(
+	ConstFSEventStreamRef stream, void* info, size_t count, void* paths,
+	const FSEventStreamEventFlags flags[], const FSEventStreamEventId ids[]
+) {
+	PathWatcher* watcher = (__bridge PathWatcher*)info;
+	[watcher changed];
+}
+
+- (instancetype) initWithURL:(NSURL*)url handler:(void (^)(void))handler {
+	if ((self = [super init])) {
+		_url = url;
+		_handler = [handler copy];
+		if (is_directory(url)) {
+			[self watchFolder];
+		} else {
+			[self watchFileAfterChange:NO];
+		}
+	}
+	return self;
+}
+
+- (void) dealloc {
+	[self stop];
+}
+
+- (void) stop {
+	_stopped = YES;
+	if (_stream) {
+		FSEventStreamStop(_stream);
+		FSEventStreamInvalidate(_stream);
+		FSEventStreamRelease(_stream);
+		_stream = NULL;
+	}
+	if (_source) {
+		dispatch_source_cancel(_source);
+		_source = nil;
+	}
+}
+
+- (void) changed {
+	if (!_stopped) _handler();
+}
+
+- (void) watchFolder {
+	FSEventStreamContext context = {0, (__bridge void*)self, NULL, NULL, NULL};
+	NSArray* paths = @[_url.path];
+	_stream = FSEventStreamCreate(
+		NULL, folder_did_change, &context, (__bridge CFArrayRef)paths, kFSEventStreamEventIdSinceNow,
+		kReloadDelay, kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagNoDefer);
+	if (!_stream) return;
+	FSEventStreamSetDispatchQueue(_stream, dispatch_get_main_queue());
+	FSEventStreamStart(_stream);
+}
+
+/*
+ * Watch the file at the URL, or look for it again later if it's gone. Saving
+ * often replaces a file with a new one, so after one is deleted or renamed,
+ * watch whatever's at the URL next. changed: whether to call the handler once
+ * the file's found.
+ */
+- (void) watchFileAfterChange:(BOOL)changed {
+	if (_stopped) return;
+	int fd = open(_url.fileSystemRepresentation, O_EVTONLY);
+	if (fd < 0) {
+		__weak PathWatcher* weakSelf = self;
+		dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kRewatchDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^(void) {
+			[weakSelf watchFileAfterChange:YES];
+		});
+		return;
+	}
+	if (changed) [self changed];
+
+	unsigned long events = DISPATCH_VNODE_WRITE | DISPATCH_VNODE_EXTEND | DISPATCH_VNODE_ATTRIB
+		| DISPATCH_VNODE_DELETE | DISPATCH_VNODE_RENAME | DISPATCH_VNODE_REVOKE;
+	dispatch_source_t source = dispatch_source_create(DISPATCH_SOURCE_TYPE_VNODE, (uintptr_t)fd, events, dispatch_get_main_queue());
+	__weak PathWatcher* weakSelf = self;
+	dispatch_source_set_event_handler(source, ^(void) {
+		PathWatcher* watcher = weakSelf;
+		if (!watcher) return;
+		[watcher changed];
+		if (dispatch_source_get_data(source) & (DISPATCH_VNODE_DELETE | DISPATCH_VNODE_RENAME | DISPATCH_VNODE_REVOKE)) {
+			dispatch_source_cancel(source);
+			watcher->_source = nil;
+			[watcher watchFileAfterChange:NO];
+		}
+	});
+	dispatch_source_set_cancel_handler(source, ^(void) {
+		close(fd);
+	});
+	_source = source;
+	dispatch_resume(source);
+}
+
+@end
+
 #pragma mark - DiffDocument
 
 /* Drags can carry file reference URLs (file:///.file/id=…); compare by path. */
@@ -2712,6 +2891,14 @@ static id path_url(NSURL* url) {
 	NSMutableArray* _urls;
 	/* A label per side, empty for none. */
 	NSMutableArray<NSString*>* _labels;
+
+	/* Watching the sides, to reload when they change. */
+	NSArray<PathWatcher*>* _watchers;
+	/* Identifies the latest reload asked for, so that earlier ones gathered in its delay don't run. */
+	NSUInteger _reloadRequest;
+	BOOL _reloading;
+	/* A reload asked for while comparing, to run when that's done. */
+	BOOL _reloadWhenCompared;
 }
 
 - (instancetype) init {
@@ -2727,6 +2914,7 @@ static id path_url(NSURL* url) {
 }
 
 - (void) dealloc {
+	for (PathWatcher* watcher in _watchers) [watcher stop];
 	dt_comparison_free(_comparison);
 }
 
@@ -2739,6 +2927,8 @@ static id path_url(NSURL* url) {
 }
 
 - (void) close {
+	for (PathWatcher* watcher in _watchers) [watcher stop];
+	_watchers = nil;
 	NSString* token = _closeToken;
 	_closeToken = nil;
 	[super close];
@@ -2798,36 +2988,97 @@ static id path_url(NSURL* url) {
 	[self urlsDidChange];
 }
 
-/* Start comparing in the background once every side is set. */
+/* Start comparing in the background once every side is set, and watch the sides for changes. */
 - (void) urlsDidChange {
 	_generation++;
 	dt_comparison_free(_comparison);
 	_comparison = NULL;
+	_reloaded = NO;
+	_reloading = NO;
+	_reloadWhenCompared = NO;
 
 	NSURL* a = [self urlForSide:0];
 	NSURL* b = [self urlForSide:1];
 	_comparing = a && b;
-	if (_comparing) {
-		NSUInteger generation = _generation;
-		NSString* pathA = a.path;
-		NSString* pathB = b.path;
-		__weak DiffDocument* weakSelf = self;
-		dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(void) {
-			DtComparison* cmp = dt_comparison_new(pathA.fileSystemRepresentation, pathB.fileSystemRepresentation);
-			dispatch_async(dispatch_get_main_queue(), ^(void) {
-				DiffDocument* doc = weakSelf;
-				if (!doc || doc->_generation != generation) {
-					dt_comparison_free(cmp);
-					return;
-				}
-				doc->_generation++;
-				doc->_comparison = cmp;
-				doc->_comparing = NO;
-				[doc notifyWindowControllers];
-			});
-		});
-	}
+	[self watchSides];
+	if (_comparing) [self compareReloading:NO];
 	[self notifyWindowControllers];
+}
+
+- (void) watchSides {
+	for (PathWatcher* watcher in _watchers) [watcher stop];
+	NSMutableArray<PathWatcher*>* watchers = [NSMutableArray array];
+	__weak DiffDocument* weakSelf = self;
+	for (NSUInteger side = 0; side < kSideCount; side++) {
+		NSURL* url = [self urlForSide:side];
+		if (!url) continue;
+		[watchers addObject:[[PathWatcher alloc] initWithURL:url handler:^(void) {
+			[weakSelf sideDidChange];
+		}]];
+	}
+	_watchers = watchers;
+}
+
+/* Reload a moment after the last of a burst of changes. */
+- (void) sideDidChange {
+	NSUInteger request = ++_reloadRequest;
+	__weak DiffDocument* weakSelf = self;
+	dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(kReloadDelay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^(void) {
+		DiffDocument* doc = weakSelf;
+		if (doc && doc->_reloadRequest == request) [doc reload];
+	});
+}
+
+- (void) reload {
+	if (![self urlForSide:0] || ![self urlForSide:1]) return;
+	if (_comparing || _reloading) {
+		_reloadWhenCompared = YES;
+		return;
+	}
+	_reloading = YES;
+	[self compareReloading:YES];
+}
+
+/*
+ * Compare the sides in the background. Reloading keeps showing the current
+ * comparison until the new one's ready, and keeps it if a side is gone, as
+ * git difftool's temporary files are once it's done.
+ */
+- (void) compareReloading:(BOOL)reloading {
+	NSUInteger generation = _generation;
+	NSString* pathA = [self urlForSide:0].path;
+	NSString* pathB = [self urlForSide:1].path;
+	__weak DiffDocument* weakSelf = self;
+	dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^(void) {
+		DtComparison* cmp = dt_comparison_new(pathA.fileSystemRepresentation, pathB.fileSystemRepresentation);
+		dispatch_async(dispatch_get_main_queue(), ^(void) {
+			DiffDocument* doc = weakSelf;
+			if (!doc || doc->_generation != generation) {
+				dt_comparison_free(cmp);
+				return;
+			}
+			DtComparison* result = cmp;
+			if (reloading) {
+				doc->_reloading = NO;
+				if (doc->_comparison && dt_comparison_error(result).len > 0) {
+					dt_comparison_free(result);
+					result = NULL;
+				}
+			}
+			if (result) {
+				dt_comparison_free(doc->_comparison);
+				doc->_generation++;
+				doc->_comparison = result;
+				doc->_comparing = NO;
+				doc->_reloaded = reloading;
+				[doc notifyWindowControllers];
+			}
+			if (doc->_reloadWhenCompared) {
+				doc->_reloadWhenCompared = NO;
+				[doc reload];
+			}
+		});
+	});
 }
 
 - (void) notifyWindowControllers {
