@@ -155,6 +155,8 @@ enum {
 	@property (nonatomic) DtFileDiff* diff;
 	@property (nonatomic) NSInteger mode;
 	@property (nonatomic) BOOL wrapsLines;
+	/* The files shown, for their context menus: an NSURL per side, or NSNull for none. */
+	@property (nonatomic, copy) NSArray* fileURLs;
 	@property (nonatomic) CGFloat fontSize;
 	/* Index of the highlighted hunk, or -1. */
 	@property (nonatomic) NSInteger currentHunk;
@@ -383,6 +385,8 @@ typedef struct {
 	- (void) drawUnifiedGroupsFrom:(size_t)first to:(size_t)last inRect:(NSRect)dirty offset:(CGFloat)offset;
 	- (void) selectHunkAtUnifiedRow:(size_t)row;
 	- (void) paneDidSelect:(DiffPaneView*)pane;
+	/* The file shown on a side, or nil. */
+	- (NSURL*) fileURLForSide:(NSUInteger)side;
 @end
 
 /* One side's text, in its own scroll view. */
@@ -1073,6 +1077,11 @@ static NSMutableData* new_tops(size_t count) {
 	}
 }
 
+- (NSURL*) fileURLForSide:(NSUInteger)side {
+	id url = side < _fileURLs.count ? _fileURLs[side] : nil;
+	return [url isKindOfClass:[NSURL class]] ? url : nil;
+}
+
 /* Only one side has a selection at a time. */
 - (void) paneDidSelect:(DiffPaneView*)selected {
 	for (DiffPaneView* pane in _panes) {
@@ -1270,6 +1279,8 @@ static NSMutableData* new_tops(size_t count) {
 	/* The selection, from _anchor where it started to _head, or none when _anchor.line < 0. */
 	TextPosition _anchor;
 	TextPosition _head;
+	/* The file the context menu is for, or nil. */
+	NSURL* _menuFile;
 }
 
 - (instancetype) initWithOwner:(DiffView*)owner side:(NSUInteger)side {
@@ -1713,9 +1724,116 @@ static NSMutableData* new_tops(size_t count) {
 }
 
 - (BOOL) validateMenuItem:(NSMenuItem*)menuItem {
-	if (menuItem.action == @selector(copy:)) return [self hasSelection];
-	if (menuItem.action == @selector(selectAll:)) return _owner.diff != NULL;
+	SEL action = menuItem.action;
+	if (action == @selector(copy:)) return [self hasSelection];
+	if (action == @selector(selectAll:)) return _owner.diff != NULL;
+	if (action == @selector(openWithApplication:) || action == @selector(revealInFinder:) || action == @selector(copyPath:)) {
+		return _menuFile != nil;
+	}
 	return YES;
+}
+
+#pragma mark Context menu
+
+/* The side of the file at a point: the pane's, or in Unified mode, the line's, B for an unchanged one. */
+- (NSUInteger) sideAtPoint:(NSPoint)point {
+	DiffView* owner = _owner;
+	if (owner.mode != kDiffModeUnified) return _side;
+	NSInteger row = [owner unifiedRowAtY:point.y];
+	if (row < 0 || (size_t)row >= dt_file_diff_unified_count(owner.diff)) return DT_SIDE_B;
+	return dt_file_diff_unified_line(owner.diff, (size_t)row, DT_SIDE_B) >= 0 ? DT_SIDE_B : DT_SIDE_A;
+}
+
+static NSMenuItem* menu_item(NSString* title, SEL action, id target) {
+	NSMenuItem* item = [[NSMenuItem alloc] initWithTitle:title action:action keyEquivalent:@""];
+	item.target = target;
+	return item;
+}
+
+- (NSMenu*) menuForEvent:(NSEvent*)event {
+	DiffView* owner = _owner;
+	if (!owner.diff) return nil;
+	NSUInteger side = [self sideAtPoint:[self convertPoint:event.locationInWindow fromView:nil]];
+	_menuFile = [owner fileURLForSide:side];
+
+	NSMenu* menu = [[NSMenu alloc] initWithTitle:@""];
+	NSString* title = side == DT_SIDE_A ? @"File A" : @"File B";
+	if (@available(macOS 14.0, *)) {
+		[menu addItem:[NSMenuItem sectionHeaderWithTitle:title]];
+	} else {
+		[menu addItem:menu_item(title, NULL, nil)];
+	}
+	NSMenuItem* openWith = menu_item(@"Open With", NULL, nil);
+	if (_menuFile) openWith.submenu = [self openWithMenuForFile:_menuFile];
+	[menu addItem:openWith];
+	[menu addItem:menu_item(@"Reveal in Finder", @selector(revealInFinder:), self)];
+	[menu addItem:menu_item(@"Copy Path", @selector(copyPath:), self)];
+	[menu addItem:[NSMenuItem separatorItem]];
+	[menu addItem:menu_item(@"Copy", @selector(copy:), self)];
+	if (@available(macOS 13.0, *)) {
+		if (_menuFile) {
+			[menu addItem:[NSMenuItem separatorItem]];
+			[menu addItem:[[NSSharingServicePicker alloc] initWithItems:@[_menuFile]].standardShareMenuItem];
+		}
+	}
+	return menu;
+}
+
+/* The apps that can open a file, its default app first. */
+- (NSMenu*) openWithMenuForFile:(NSURL*)file {
+	NSMenu* menu = [[NSMenu alloc] initWithTitle:@"Open With"];
+	NSURL* defaultApp = [[NSWorkspace sharedWorkspace] URLForApplicationToOpenURL:file];
+	if (defaultApp) {
+		[menu addItem:[self itemOpeningWithApplication:defaultApp suffix:@" (default)"]];
+	}
+
+	NSArray<NSURL*>* apps = CFBridgingRelease(LSCopyApplicationURLsForURL((__bridge CFURLRef)file, kLSRolesAll));
+	NSMutableArray<NSMenuItem*>* others = [NSMutableArray array];
+	NSMutableSet<NSString*>* seen = [NSMutableSet set];
+	if (defaultApp.path) [seen addObject:defaultApp.path];
+	for (NSURL* app in apps) {
+		if (!app.path || [seen containsObject:app.path]) continue;
+		[seen addObject:app.path];
+		[others addObject:[self itemOpeningWithApplication:app suffix:@""]];
+	}
+	[others sortUsingComparator:^NSComparisonResult(NSMenuItem* a, NSMenuItem* b) {
+		return [a.title localizedStandardCompare:b.title];
+	}];
+	if (defaultApp && others.count > 0) [menu addItem:[NSMenuItem separatorItem]];
+	for (NSMenuItem* item in others) [menu addItem:item];
+	return menu;
+}
+
+- (NSMenuItem*) itemOpeningWithApplication:(NSURL*)app suffix:(NSString*)suffix {
+	NSString* name = [[NSFileManager defaultManager] displayNameAtPath:app.path];
+	if ([name.pathExtension isEqualToString:@"app"]) name = name.stringByDeletingPathExtension;
+	NSMenuItem* item = menu_item([name stringByAppendingString:suffix], @selector(openWithApplication:), self);
+	item.representedObject = app;
+	NSImage* icon = [[[NSWorkspace sharedWorkspace] iconForFile:app.path] copy];
+	icon.size = NSMakeSize(16, 16);
+	item.image = icon;
+	return item;
+}
+
+- (IBAction) openWithApplication:(NSMenuItem*)sender {
+	NSURL* app = sender.representedObject;
+	if (!_menuFile || ![app isKindOfClass:[NSURL class]]) return;
+	[[NSWorkspace sharedWorkspace]
+		openURLs:@[_menuFile]
+		withApplicationAtURL:app
+		configuration:[NSWorkspaceOpenConfiguration configuration]
+		completionHandler:nil];
+}
+
+- (IBAction) revealInFinder:(id)sender {
+	if (_menuFile) [[NSWorkspace sharedWorkspace] activateFileViewerSelectingURLs:@[_menuFile]];
+}
+
+- (IBAction) copyPath:(id)sender {
+	if (!_menuFile) return;
+	NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
+	[pasteboard clearContents];
+	[pasteboard setString:_menuFile.path forType:NSPasteboardTypeString];
 }
 
 @end
@@ -2229,6 +2347,12 @@ static NSArray<NSURL*>* dragged_file_urls(id<NSDraggingInfo> info) {
 			_fileMessage = (flags & DT_DIFF_IDENTICAL) ? @"The binary files are identical." : @"The binary files differ.";
 		}
 	}
+	NSMutableArray* files = [NSMutableArray array];
+	for (NSUInteger side = 0; side < kSideCount; side++) {
+		NSString* path = cmp && entry >= 0 ? dt_string(dt_comparison_entry_path(cmp, (size_t)entry, (uint8_t)side)) : @"";
+		[files addObject:path.length > 0 ? (id)[NSURL fileURLWithPath:path] : [NSNull null]];
+	}
+	_diffView.fileURLs = files;
 	_diffView.diff = diff;
 	[_diffView scrollToCurrentHunk];
 
