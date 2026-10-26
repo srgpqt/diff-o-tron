@@ -383,6 +383,11 @@ typedef struct {
 	- (void) hunk:(DtHunk)hunk side:(NSUInteger)side start:(uint32_t*)start end:(uint32_t*)end;
 	- (BOOL) rowInCurrentHunk:(size_t)row;
 	- (BOOL) lineInCurrentHunk:(size_t)line side:(NSUInteger)side;
+	/*
+	 * Whether a side has no lines, as for an added or deleted file. Its hunks
+	 * aren't outlined, nor joined to the other side's.
+	 */
+	- (BOOL) sideIsEmpty:(NSUInteger)side;
 	/* Outline the hunks in dirty, drawn offset up, with bands filling them if bands is set. */
 	- (void) drawHunksInRect:(NSRect)dirty offset:(CGFloat)offset bands:(BOOL)bands;
 	/* In Fluid mode, outline a side's hunks in dirty, its own layout drawn offset up. */
@@ -952,8 +957,12 @@ static NSMutableData* new_tops(size_t count) {
 	}
 }
 
+- (BOOL) sideIsEmpty:(NSUInteger)side {
+	return !_diff || dt_file_diff_line_count(_diff, (uint8_t)side) == 0;
+}
+
 - (void) drawSideHunks:(NSUInteger)side inRect:(NSRect)dirty offset:(CGFloat)offset {
-	if (!_diff) return;
+	if ([self sideIsEmpty:side]) return;
 	size_t count = dt_file_diff_hunk_count(_diff);
 	for (size_t i = 0; i < count; i++) {
 		DtHunk hunk = dt_file_diff_hunk(_diff, i);
@@ -1137,6 +1146,7 @@ static NSMutableData* new_tops(size_t count) {
 
 - (void) drawFlashForSide:(NSUInteger)side inRect:(NSRect)dirty offset:(CGFloat)offset {
 	if (_flash <= 0 || !_diff || _currentHunk < 0 || (size_t)_currentHunk >= dt_file_diff_hunk_count(_diff)) return;
+	if (_mode != kDiffModeUnified && [self sideIsEmpty:side]) return;
 	DtHunk hunk = dt_file_diff_hunk(_diff, (size_t)_currentHunk);
 	CGFloat top, bottom;
 	if (_mode == kDiffModeUnified) {
@@ -1255,7 +1265,7 @@ static NSMutableData* new_tops(size_t count) {
 		int32_t line = dt_file_diff_row_line(diff, row, (uint8_t)_side);
 		[self drawLine:line side:_side frame:frame current:[owner rowInCurrentHunk:row]];
 	}
-	[owner drawHunksInRect:dirty offset:offset bands:NO];
+	if (![owner sideIsEmpty:_side]) [owner drawHunksInRect:dirty offset:offset bands:NO];
 	[owner drawFlashForSide:_side inRect:dirty offset:offset];
 }
 
@@ -1304,6 +1314,8 @@ static NSMutableData* new_tops(size_t count) {
 	[g_middle_color setFill];
 	NSRectFill(dirty);
 	DiffView* owner = _owner;
+	/* Nothing to join to a side with no lines. */
+	if ([owner sideIsEmpty:_side] || [owner sideIsEmpty:_side + 1]) return;
 	if (owner.mode != kDiffModeFluid) {
 		[owner drawHunksInRect:dirty offset:[owner verticalOffset:_side] bands:YES];
 		return;
@@ -1526,7 +1538,7 @@ static NSMutableData* new_tops(size_t count) {
 		int32_t line = dt_file_diff_row_line(owner.diff, row, (uint8_t)_side);
 		[self drawLine:line side:_side selectionLine:line frame:frame current:[owner rowInCurrentHunk:row]];
 	}
-	[owner drawHunksInRect:dirty offset:0 bands:NO];
+	if (![owner sideIsEmpty:_side]) [owner drawHunksInRect:dirty offset:0 bands:NO];
 	[owner drawFlashForSide:_side inRect:dirty offset:0];
 }
 
