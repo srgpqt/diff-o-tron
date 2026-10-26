@@ -599,7 +599,10 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 			NSRectFill(NSMakeRect(NSMinX(dirty), top, NSWidth(dirty), bottom - top));
 		}
 		[g_edge_colors[kind] setFill];
-		NSRectFill(NSMakeRect(NSMinX(dirty), top, NSWidth(dirty), 1));
+		/* Where the hunk before ends, its bottom edge is this one's top. */
+		if (i == 0 || dt_file_diff_hunk(_diff, i - 1).row_end != hunk.row_start) {
+			NSRectFill(NSMakeRect(NSMinX(dirty), top, NSWidth(dirty), 1));
+		}
 		NSRectFill(NSMakeRect(NSMinX(dirty), bottom - 1, NSWidth(dirty), 1));
 	}
 }
@@ -614,9 +617,14 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 		CGFloat top = [self rowY:start] - offset;
 		CGFloat bottom = [self rowY:end] - offset;
 		if (bottom < NSMinY(dirty) - 1 || top > NSMaxY(dirty) + 1) continue;
-		/* A hunk with no lines on this side is a single line where they'd be. */
+		/*
+		 * A hunk with no lines on this side is a single line where they'd be.
+		 * Where the hunk before ends, its bottom edge is this one's top.
+		 */
+		uint32_t previousStart = 0, previousEnd = UINT32_MAX;
+		if (i > 0) [self hunk:dt_file_diff_hunk(_diff, i - 1) side:side start:&previousStart end:&previousEnd];
 		[g_edge_colors[hunk_kind(hunk)] setFill];
-		NSRectFill(NSMakeRect(NSMinX(dirty), top, NSWidth(dirty), 1));
+		if (previousEnd != start) NSRectFill(NSMakeRect(NSMinX(dirty), top, NSWidth(dirty), 1));
 		if (bottom - top >= 2) NSRectFill(NSMakeRect(NSMinX(dirty), bottom - 1, NSWidth(dirty), 1));
 	}
 }

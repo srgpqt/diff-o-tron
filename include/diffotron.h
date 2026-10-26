@@ -86,7 +86,10 @@ typedef struct {
 	const DtSpan *spans;
 } DtLine;
 
-/* A block of consecutive changed rows. Ranges are half-open. */
+/*
+ * A change: consecutive rows of changed lines that are either all paired with
+ * similar lines on the other side, or all unpaired. Ranges are half-open.
+ */
 typedef struct {
 	uint32_t row_start, row_end;
 	uint32_t a_start, a_end;

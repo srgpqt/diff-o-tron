@@ -55,7 +55,8 @@ pub struct Row {
     pub b: Option<u32>,
 }
 
-/// A block of consecutive changed rows.
+/// A change: consecutive rows of changed lines that are either all paired with similar lines on
+/// the other side, or all unpaired.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Hunk {
     pub rows: Range<u32>,
@@ -182,7 +183,6 @@ impl FileDiff {
     /// Lay out the unified view. Within a hunk, each run of rows that pair changed lines shows
     /// the run's A lines and then its B lines, and so does each run of unpaired lines.
     fn push_unified(&mut self) {
-        let paired = |row: &Row| row.a.is_some_and(|a| self.a.kinds[a as usize] == LineKind::Changed);
         let mut unified = Vec::with_capacity(self.rows.len());
         let mut ranges = Vec::with_capacity(self.hunks.len());
         let mut next = 0;
@@ -190,7 +190,7 @@ impl FileDiff {
             let (start, end) = (hunk.rows.start as usize, hunk.rows.end as usize);
             unified.extend_from_slice(&self.rows[next..start]);
             let first = unified.len() as u32;
-            for run in self.rows[start..end].chunk_by(|x, y| paired(x) == paired(y)) {
+            for run in self.rows[start..end].chunk_by(|x, y| self.paired(x) == self.paired(y)) {
                 unified.extend(run.iter().filter_map(|r| r.a).map(|a| Row { a: Some(a), b: None }));
                 unified.extend(run.iter().filter_map(|r| r.b).map(|b| Row { a: None, b: Some(b) }));
             }
@@ -239,7 +239,28 @@ impl FileDiff {
         }
         self.push_unpaired(&mut minus, &mut plus);
 
-        self.hunks.push(Hunk { rows: first_row..self.rows.len() as u32, a, b, unified: 0..0 });
+        // A hunk of the line diff for each run of paired rows and each run of unpaired rows.
+        let (mut row, mut a_next, mut b_next) = (first_row, a.start, b.start);
+        let mut hunks = Vec::new();
+        for run in self.rows[first_row as usize..].chunk_by(|x, y| self.paired(x) == self.paired(y)) {
+            let a_count = run.iter().filter(|r| r.a.is_some()).count() as u32;
+            let b_count = run.iter().filter(|r| r.b.is_some()).count() as u32;
+            let len = run.len() as u32;
+            hunks.push(Hunk {
+                rows: row..row + len,
+                a: a_next..a_next + a_count,
+                b: b_next..b_next + b_count,
+                unified: 0..0,
+            });
+            (row, a_next, b_next) = (row + len, a_next + a_count, b_next + b_count);
+        }
+        debug_assert_eq!((a_next, b_next), (a.end, b.end));
+        self.hunks.extend(hunks);
+    }
+
+    /// Whether a row pairs changed lines.
+    fn paired(&self, row: &Row) -> bool {
+        row.a.is_some_and(|a| self.a.kinds[a as usize] == LineKind::Changed)
     }
 
     fn push_unpaired(&mut self, minus: &mut Vec<u32>, plus: &mut Vec<u32>) {
@@ -430,7 +451,25 @@ mod tests {
                 (Some(4), Some(4)),
             ]
         );
-        assert_eq!(d.hunks[0].unified, 1..7);
+        assert_eq!(d.hunks.iter().map(|h| h.unified.clone()).collect::<Vec<_>>(), [1..5, 5..7]);
+    }
+
+    #[test]
+    fn hunks_split_into_paired_and_unpaired_runs() {
+        // One hunk of the line diff: a changed line, a removed one, then another changed line.
+        let d = diff("x\nlet a = 1;\nremoved line here\nlet b = 2;\ny\n", "x\nlet a = 10;\nlet b = 20;\ny\n");
+        assert_eq!(
+            rows(&d),
+            [(Some(0), Some(0)), (Some(1), Some(1)), (Some(2), None), (Some(3), Some(2)), (Some(4), Some(3))]
+        );
+        assert_eq!(
+            d.hunks,
+            [
+                Hunk { rows: 1..2, a: 1..2, b: 1..2, unified: 1..3 },
+                Hunk { rows: 2..3, a: 2..3, b: 2..2, unified: 3..4 },
+                Hunk { rows: 3..4, a: 3..4, b: 2..3, unified: 4..6 },
+            ]
+        );
     }
 
     #[test]
