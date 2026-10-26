@@ -1,0 +1,27 @@
+[package]
+name = "diffotron"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+exclude = ["vendor", "design", "_build"]
+
+[lib]
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+imara-diff = { version = "0.2", default-features = false }
+regex = "1.7.1"
+unicode-segmentation = "1.10.1"
+# Pinned like vendor/delta: 0.2 treats \n as width 1, which delta's edit inference doesn't expect.
+unicode-width = ">=0.1.14, <0.2.0"
+
+[dev-dependencies]
+# Used by the tests of the vendored delta modules.
+itertools = "0.10.5"
+lazy_static = "1.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"

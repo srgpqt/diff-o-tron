@@ -4,6 +4,22 @@
 <dict>
 	<key>CFBundleDevelopmentRegion</key>
 	<string>en</string>
+	<key>CFBundleDocumentTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeName</key>
+			<string>File or Folder</string>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>LSHandlerRank</key>
+			<string>None</string>
+			<key>LSItemContentTypes</key>
+			<array>
+				<string>public.item</string>
+				<string>public.folder</string>
+			</array>
+		</dict>
+	</array>
 	<key>CFBundleExecutable</key>
 	<string>Diff-o-tron</string>
 	<key>CFBundleIconFile</key>
@@ -17,17 +33,17 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>1.0</string>
+	<string>@APP_VERSION@</string>
 	<key>CFBundleSupportedPlatforms</key>
 	<array>
 		<string>MacOSX</string>
 	</array>
 	<key>CFBundleVersion</key>
-	<string>1</string>
+	<string>@APP_BUILD@</string>
 	<key>LSApplicationCategoryType</key>
 	<string>public.app-category.developer-tools</string>
 	<key>LSMinimumSystemVersion</key>
-	<string>10.10.0</string>
+	<string>@MACOS_MIN@</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright © 2026 Serge Paquet. All rights reserved.</string>
 	<key>NSPrincipalClass</key>
