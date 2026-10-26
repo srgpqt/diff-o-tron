@@ -1,4 +1,5 @@
 #import <Cocoa/Cocoa.h>
+#import <CoreText/CoreText.h>
 
 #include <math.h>
 
@@ -173,17 +174,44 @@ static const CGFloat kMiddleWidth = 40;
 static const CGFloat kGutterPadding = 8;
 static const CGFloat kTextPadding = 8;
 
+/* A caret position in one side's text: a line, and a UTF-16 offset into it. */
+typedef struct {
+	NSInteger line;
+	NSUInteger index;
+} TextPosition;
+
+static const TextPosition kNoPosition = {-1, 0};
+
+static BOOL position_before(TextPosition a, TextPosition b) {
+	return a.line < b.line || (a.line == b.line && a.index < b.index);
+}
+
+static BOOL position_equal(TextPosition a, TextPosition b) {
+	return a.line == b.line && a.index == b.index;
+}
+
+static NSUInteger min_index(NSUInteger a, NSUInteger b) {
+	return a < b ? a : b;
+}
+
 @implementation DiffView {
 	NSFont* _font;
+	/* Core Text attributes, so drawing and hit testing share one layout. */
 	NSDictionary* _textAttributes;
 	NSDictionary* _numberAttributes;
 	NSDictionary* _currentNumberAttributes;
 	CGFloat _lineHeight;
+	CGFloat _fontLineHeight;
 	CGFloat _textInset;
 	CGFloat _charWidth;
 	CGFloat _gutterWidth;
 	uint32_t _maxColumns;
 	size_t _maxLines;
+
+	/* The selection is within one side: from _anchor, where it started, to _head. */
+	NSInteger _selectionSide;
+	TextPosition _anchor;
+	TextPosition _head;
 }
 
 + (void) initialize {
@@ -193,6 +221,7 @@ static const CGFloat kTextPadding = 8;
 - (instancetype) initWithFrame:(NSRect)frame {
 	if ((self = [super initWithFrame:frame])) {
 		_currentHunk = -1;
+		_selectionSide = -1;
 		self.fontSize = 12;
 	}
 	return self;
@@ -206,6 +235,16 @@ static const CGFloat kTextPadding = 8;
 - (BOOL) isOpaque { return YES; }
 - (BOOL) acceptsFirstResponder { return YES; }
 
+- (BOOL) becomeFirstResponder {
+	[self setNeedsDisplay:YES];
+	return YES;
+}
+
+- (BOOL) resignFirstResponder {
+	[self setNeedsDisplay:YES];
+	return YES;
+}
+
 - (void) viewDidMoveToSuperview {
 	[super viewDidMoveToSuperview];
 	NSClipView* clip = self.enclosingScrollView.contentView;
@@ -218,8 +257,21 @@ static const CGFloat kTextPadding = 8;
 		object:clip];
 }
 
+- (void) viewDidMoveToWindow {
+	[super viewDidMoveToWindow];
+	if (!self.window) return;
+	/* The selection is drawn dimmed while the window isn't key. */
+	NSNotificationCenter* center = [NSNotificationCenter defaultCenter];
+	[center addObserver:self selector:@selector(windowKeyDidChange:) name:NSWindowDidBecomeKeyNotification object:self.window];
+	[center addObserver:self selector:@selector(windowKeyDidChange:) name:NSWindowDidResignKeyNotification object:self.window];
+}
+
 - (void) clipViewFrameDidChange:(NSNotification*)notification {
 	[self relayout];
+}
+
+- (void) windowKeyDidChange:(NSNotification*)notification {
+	if (_selectionSide >= 0) [self setNeedsDisplay:YES];
 }
 
 - (void) setDiff:(DtFileDiff*)diff {
@@ -227,6 +279,7 @@ static const CGFloat kTextPadding = 8;
 	dt_file_diff_free(_diff);
 	_diff = diff;
 	_currentHunk = diff && dt_file_diff_hunk_count(diff) > 0 ? 0 : -1;
+	_selectionSide = -1;
 
 	_maxColumns = 0;
 	_maxLines = 0;
@@ -248,19 +301,23 @@ static const CGFloat kTextPadding = 8;
 	_fontSize = fontSize;
 	_font = [NSFont monospacedSystemFontOfSize:fontSize weight:NSFontWeightRegular];
 	NSLayoutManager* layoutManager = [[NSLayoutManager alloc] init];
-	CGFloat fontLineHeight = [layoutManager defaultLineHeightForFont:_font];
-	_lineHeight = ceil(fontLineHeight * 1.3);
-	_textInset = floor((_lineHeight - fontLineHeight) / 2);
+	_fontLineHeight = [layoutManager defaultLineHeightForFont:_font];
+	_lineHeight = ceil(_fontLineHeight * 1.3);
+	_textInset = floor((_lineHeight - _fontLineHeight) / 2);
 	_charWidth = [@"0" sizeWithAttributes:@{NSFontAttributeName: _font}].width;
 
-	NSMutableParagraphStyle* paragraph = [[NSMutableParagraphStyle alloc] init];
-	paragraph.tabStops = @[];
-	paragraph.defaultTabInterval = _charWidth * kTabWidth;
-	paragraph.lineBreakMode = NSLineBreakByClipping;
+	NSArray* tabStops = @[];
+	CFArrayRef tabStopsRef = (__bridge CFArrayRef)tabStops;
+	CGFloat tabInterval = _charWidth * kTabWidth;
+	CTParagraphStyleSetting settings[] = {
+		{kCTParagraphStyleSpecifierTabStops, sizeof tabStopsRef, &tabStopsRef},
+		{kCTParagraphStyleSpecifierDefaultTabInterval, sizeof tabInterval, &tabInterval},
+	};
+	id paragraph = CFBridgingRelease(CTParagraphStyleCreate(settings, sizeof settings / sizeof settings[0]));
 	_textAttributes = @{
-		NSFontAttributeName: _font,
-		NSForegroundColorAttributeName: [NSColor textColor],
-		NSParagraphStyleAttributeName: paragraph
+		(__bridge NSString*)kCTFontAttributeName: _font,
+		(__bridge NSString*)kCTParagraphStyleAttributeName: paragraph,
+		(__bridge NSString*)kCTForegroundColorFromContextAttributeName: @YES
 	};
 	NSFont* numberFont = [NSFont monospacedDigitSystemFontOfSize:fontSize weight:NSFontWeightRegular];
 	_numberAttributes = @{
@@ -295,6 +352,7 @@ static const CGFloat kTextPadding = 8;
 	CGFloat width = fmax(visible.width, (CGFloat)kSideCount * pane + (CGFloat)(kSideCount - 1) * kMiddleWidth);
 	CGFloat height = fmax(visible.height, 2 * kTopPadding + (CGFloat)rows * _lineHeight);
 	[self setFrameSize:NSMakeSize(floor(width), ceil(height))];
+	[self.window invalidateCursorRectsForView:self];
 	[self setNeedsDisplay:YES];
 }
 
@@ -306,9 +364,40 @@ static const CGFloat kTextPadding = 8;
 	return (CGFloat)side * ([self paneWidth] + kMiddleWidth);
 }
 
+/* Where a side's text starts, after its line number gutter. */
+- (CGFloat) textX:(NSUInteger)side {
+	return [self paneX:side] + _gutterWidth + kTextPadding;
+}
+
 - (CGFloat) rowY:(size_t)row {
 	return kTopPadding + (CGFloat)row * _lineHeight;
 }
+
+- (void) resetCursorRects {
+	for (NSUInteger side = 0; side < kSideCount; side++) {
+		CGFloat x = [self textX:side];
+		NSRect text = NSMakeRect(x, 0, [self paneX:side] + [self paneWidth] - x, NSHeight(self.bounds));
+		[self addCursorRect:text cursor:[NSCursor IBeamCursor]];
+	}
+}
+
+#pragma mark Text
+
+- (NSString*) textOfLine:(NSInteger)line side:(NSUInteger)side {
+	if (!_diff || line < 0) return @"";
+	return dt_string(dt_file_diff_line(_diff, (uint8_t)side, (size_t)line).text);
+}
+
+- (CTLineRef) createCTLine:(NSString*)text CF_RETURNS_RETAINED {
+	NSAttributedString* string = [[NSAttributedString alloc] initWithString:text attributes:_textAttributes];
+	return CTLineCreateWithAttributedString((__bridge CFAttributedStringRef)string);
+}
+
+- (CGFloat) offsetOfIndex:(NSUInteger)index inLine:(CTLineRef)ctLine {
+	return CTLineGetOffsetForStringIndex(ctLine, (CFIndex)index, NULL);
+}
+
+#pragma mark Drawing
 
 - (void) drawRect:(NSRect)dirty {
 	[[NSColor textBackgroundColor] setFill];
@@ -385,41 +474,233 @@ static const CGFloat kTextPadding = 8;
 	[number drawAtPoint:numberPoint withAttributes:numberAttributes];
 
 	NSString* text = dt_string(line.text);
-	if (text.length == 0) return;
-	NSMutableAttributedString* string = [[NSMutableAttributedString alloc] initWithString:text attributes:_textAttributes];
+	CGFloat textX = [self textX:side];
+	NSRect textFrame = NSMakeRect(textX - kTextPadding, NSMinY(frame), NSMaxX(frame) - textX + kTextPadding, NSHeight(frame));
+	CTLineRef ctLine = [self createCTLine:text];
+
+	[NSGraphicsContext saveGraphicsState];
+	NSRectClip(textFrame);
+
 	for (uint32_t i = 0; changed && i < line.span_count; i++) {
 		DtSpan span = line.spans[i];
 		if (span.start16 >= span.end16 || span.end16 > text.length) continue;
-		[string
-			addAttribute:NSBackgroundColorAttributeName
-			value:g_emphasis_colors[line.kind]
-			range:NSMakeRange(span.start16, span.end16 - span.start16)];
+		CGFloat x0 = textX + [self offsetOfIndex:span.start16 inLine:ctLine];
+		CGFloat x1 = textX + [self offsetOfIndex:span.end16 inLine:ctLine];
+		[g_emphasis_colors[line.kind] setFill];
+		NSRectFill(NSMakeRect(x0, NSMinY(frame) + _textInset, x1 - x0, _fontLineHeight));
 	}
 
-	NSRect textFrame = NSMakeRect(
-		NSMaxX(gutter) + kTextPadding, NSMinY(frame),
-		NSWidth(frame) - _gutterWidth - kTextPadding, NSHeight(frame));
-	[NSGraphicsContext saveGraphicsState];
-	NSRectClip(textFrame);
-	[string drawAtPoint:NSMakePoint(NSMinX(textFrame), NSMinY(frame) + _textInset)];
+	NSUInteger from = 0, to = 0;
+	BOOL throughEnd = NO;
+	if ([self selectionInLine:lineIndex side:side from:&from to:&to throughEnd:&throughEnd]) {
+		CGFloat x0 = textX + [self offsetOfIndex:from inLine:ctLine];
+		CGFloat x1 = throughEnd ? NSMaxX(textFrame) : textX + [self offsetOfIndex:to inLine:ctLine];
+		BOOL active = self.window.isKeyWindow && self.window.firstResponder == self;
+		[(active ? [NSColor selectedTextBackgroundColor] : [NSColor unemphasizedSelectedTextBackgroundColor]) setFill];
+		NSRectFill(NSMakeRect(x0, NSMinY(frame), x1 - x0, NSHeight(frame)));
+	}
+
+	CGContextRef context = [NSGraphicsContext currentContext].CGContext;
+	[[NSColor textColor] setFill];
+	/* Core Text draws upside down in a flipped view unless its text matrix flips it back. */
+	CGContextSetTextMatrix(context, CGAffineTransformMakeScale(1, -1));
+	CGContextSetTextPosition(context, textX, NSMinY(frame) + _textInset + _font.ascender);
+	CTLineDraw(ctLine, context);
+
 	[NSGraphicsContext restoreGraphicsState];
+	CFRelease(ctLine);
+}
+
+#pragma mark Selection
+
+- (BOOL) hasSelection {
+	return _selectionSide >= 0 && !position_equal(_anchor, _head);
+}
+
+/* The selection's start and end, in order. */
+- (void) selectionStart:(TextPosition*)start end:(TextPosition*)end {
+	BOOL forward = position_before(_anchor, _head);
+	*start = forward ? _anchor : _head;
+	*end = forward ? _head : _anchor;
+}
+
+/* The selected part of a line, and whether the selection continues past its end. */
+- (BOOL) selectionInLine:(NSInteger)line side:(NSUInteger)side from:(NSUInteger*)from to:(NSUInteger*)to throughEnd:(BOOL*)throughEnd {
+	if (![self hasSelection] || (NSUInteger)_selectionSide != side) return NO;
+	TextPosition start, end;
+	[self selectionStart:&start end:&end];
+	if (line < start.line || line > end.line) return NO;
+	*from = line == start.line ? start.index : 0;
+	*to = line == end.line ? end.index : NSUIntegerMax;
+	*throughEnd = line < end.line;
+	return YES;
+}
+
+- (NSString*) selectedText {
+	if (![self hasSelection]) return @"";
+	TextPosition start, end;
+	[self selectionStart:&start end:&end];
+	NSUInteger side = (NSUInteger)_selectionSide;
+	NSMutableString* text = [NSMutableString string];
+	for (NSInteger line = start.line; line <= end.line; line++) {
+		NSString* lineText = [self textOfLine:line side:side];
+		NSUInteger from = line == start.line ? min_index(start.index, lineText.length) : 0;
+		NSUInteger to = line == end.line ? min_index(end.index, lineText.length) : lineText.length;
+		if (to > from) [text appendString:[lineText substringWithRange:NSMakeRange(from, to - from)]];
+		if (line < end.line) [text appendString:@"\n"];
+	}
+	return text;
+}
+
+- (void) selectFrom:(TextPosition)anchor to:(TextPosition)head side:(NSUInteger)side {
+	_selectionSide = (NSInteger)side;
+	_anchor = anchor;
+	_head = head;
+	[self setNeedsDisplay:YES];
+}
+
+/* The side under x, picking the nearer one in the middle gutters. */
+- (NSUInteger) sideAtX:(CGFloat)x {
+	CGFloat stride = [self paneWidth] + kMiddleWidth;
+	CGFloat side = floor((x + kMiddleWidth / 2) / stride);
+	if (side < 0) return 0;
+	if (side >= (CGFloat)kSideCount) return kSideCount - 1;
+	return (NSUInteger)side;
+}
+
+/* The caret position nearest a point, in the given side's text. */
+- (TextPosition) positionAtPoint:(NSPoint)point side:(NSUInteger)side {
+	if (!_diff) return kNoPosition;
+	size_t rows = dt_file_diff_row_count(_diff);
+	size_t lines = dt_file_diff_line_count(_diff, (uint8_t)side);
+	if (rows == 0 || lines == 0) return kNoPosition;
+	if (point.y < kTopPadding) return (TextPosition){0, 0};
+
+	size_t row = (size_t)floor((point.y - kTopPadding) / _lineHeight);
+	if (row >= rows) {
+		NSInteger lastLine = (NSInteger)lines - 1;
+		return (TextPosition){lastLine, [self textOfLine:lastLine side:side].length};
+	}
+
+	int32_t line = dt_file_diff_row_line(_diff, row, (uint8_t)side);
+	if (line < 0) {
+		/* A filler row: the end of the line before it, or else the start of the line after. */
+		for (size_t r = row; r-- > 0;) {
+			int32_t before = dt_file_diff_row_line(_diff, r, (uint8_t)side);
+			if (before >= 0) return (TextPosition){before, [self textOfLine:before side:side].length};
+		}
+		for (size_t r = row + 1; r < rows; r++) {
+			int32_t after = dt_file_diff_row_line(_diff, r, (uint8_t)side);
+			if (after >= 0) return (TextPosition){after, 0};
+		}
+		return kNoPosition;
+	}
+
+	CGFloat x = point.x - [self textX:side];
+	if (x <= 0) return (TextPosition){line, 0};
+	NSString* text = [self textOfLine:line side:side];
+	CTLineRef ctLine = [self createCTLine:text];
+	CFIndex index = CTLineGetStringIndexForPosition(ctLine, CGPointMake(x, 0));
+	CFRelease(ctLine);
+	if (index < 0) index = 0;
+	return (TextPosition){line, min_index((NSUInteger)index, text.length)};
 }
 
 - (void) mouseDown:(NSEvent*)event {
 	[self.window makeFirstResponder:self];
 	if (!_diff) return;
 	NSPoint point = [self convertPoint:event.locationInWindow fromView:nil];
-	if (point.y < kTopPadding) return;
-	size_t row = (size_t)floor((point.y - kTopPadding) / _lineHeight);
-	size_t count = dt_file_diff_hunk_count(_diff);
-	for (size_t i = 0; i < count; i++) {
-		DtHunk hunk = dt_file_diff_hunk(_diff, i);
-		if (row >= hunk.row_start && row < hunk.row_end) {
-			self.currentHunk = (NSInteger)i;
-			if (_currentHunkChanged) _currentHunkChanged();
-			return;
+
+	if (point.y >= kTopPadding) {
+		size_t row = (size_t)floor((point.y - kTopPadding) / _lineHeight);
+		size_t count = dt_file_diff_hunk_count(_diff);
+		for (size_t i = 0; i < count; i++) {
+			DtHunk hunk = dt_file_diff_hunk(_diff, i);
+			if (row >= hunk.row_start && row < hunk.row_end) {
+				self.currentHunk = (NSInteger)i;
+				if (_currentHunkChanged) _currentHunkChanged();
+				break;
+			}
 		}
 	}
+
+	NSUInteger side = [self sideAtX:point.x];
+	BOOL extend = (event.modifierFlags & NSEventModifierFlagShift) && _selectionSide == (NSInteger)side;
+	TextPosition position = [self positionAtPoint:point side:side];
+	if (position.line < 0) {
+		_selectionSide = -1;
+		[self setNeedsDisplay:YES];
+		return;
+	}
+
+	if (extend) {
+		[self selectFrom:_anchor to:position side:side];
+	} else if (event.clickCount == 2) {
+		NSString* text = [self textOfLine:position.line side:side];
+		NSRange word = NSMakeRange(position.index, 0);
+		if (text.length > 0) {
+			NSAttributedString* string = [[NSAttributedString alloc] initWithString:text];
+			word = [string doubleClickAtIndex:min_index(position.index, text.length - 1)];
+		}
+		TextPosition start = {position.line, word.location};
+		TextPosition end = {position.line, NSMaxRange(word)};
+		[self selectFrom:start to:end side:side];
+	} else if (event.clickCount >= 3) {
+		/* The whole line, through its line break when there's a next line. */
+		TextPosition start = {position.line, 0};
+		TextPosition end = {position.line, [self textOfLine:position.line side:side].length};
+		if ((size_t)position.line + 1 < dt_file_diff_line_count(_diff, (uint8_t)side)) {
+			end = (TextPosition){position.line + 1, 0};
+		}
+		[self selectFrom:start to:end side:side];
+	} else {
+		[self selectFrom:position to:position side:side];
+	}
+
+	[self trackSelectionFrom:event side:side];
+}
+
+/* Extend the selection until the mouse is released, scrolling while it's outside the view. */
+- (void) trackSelectionFrom:(NSEvent*)event side:(NSUInteger)side {
+	NSEvent* drag = event;
+	[NSEvent startPeriodicEventsAfterDelay:0.1 withPeriod:0.05];
+	for (;;) {
+		NSEvent* next = [self.window
+			nextEventMatchingMask:NSEventMaskLeftMouseDragged | NSEventMaskLeftMouseUp | NSEventMaskPeriodic];
+		if (next.type == NSEventTypeLeftMouseUp) break;
+		if (next.type == NSEventTypeLeftMouseDragged) drag = next;
+		if (drag == event) continue;
+		[self autoscroll:drag];
+		NSPoint point = [self convertPoint:drag.locationInWindow fromView:nil];
+		TextPosition position = [self positionAtPoint:point side:side];
+		if (position.line >= 0 && !position_equal(position, _head)) [self selectFrom:_anchor to:position side:side];
+	}
+	[NSEvent stopPeriodicEvents];
+}
+
+- (IBAction) copy:(id)sender {
+	if (![self hasSelection]) return;
+	NSPasteboard* pasteboard = [NSPasteboard generalPasteboard];
+	[pasteboard clearContents];
+	[pasteboard setString:[self selectedText] forType:NSPasteboardTypeString];
+}
+
+/* Select all of the side last selected in, or else side A. */
+- (IBAction) selectAll:(id)sender {
+	if (!_diff) return;
+	NSUInteger side = _selectionSide >= 0 ? (NSUInteger)_selectionSide : 0;
+	size_t lines = dt_file_diff_line_count(_diff, (uint8_t)side);
+	if (lines == 0) return;
+	NSInteger lastLine = (NSInteger)lines - 1;
+	TextPosition start = {0, 0};
+	TextPosition end = {lastLine, [self textOfLine:lastLine side:side].length};
+	[self selectFrom:start to:end side:side];
+}
+
+- (BOOL) validateMenuItem:(NSMenuItem*)menuItem {
+	if (menuItem.action == @selector(copy:)) return [self hasSelection];
+	if (menuItem.action == @selector(selectAll:)) return _diff != NULL;
+	return YES;
 }
 
 /* Scroll the current hunk to a third of the way down, unless it's already in view. */
