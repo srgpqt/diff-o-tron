@@ -88,6 +88,13 @@ int main(int argc, char **argv) {
 	CHECK(hunk.row_start == 3 && hunk.row_end == 4);
 	CHECK(hunk.a_start == 3 && hunk.a_end == 3);
 	CHECK(hunk.b_start == 3 && hunk.b_end == 4);
+	/* one, the changed line on side A then on side B, three, four */
+	CHECK(hunk.unified_start == 4 && hunk.unified_end == 5);
+	CHECK(dt_file_diff_unified_count(diff) == 5);
+	CHECK(dt_file_diff_unified_line(diff, 1, DT_SIDE_A) == 1 && dt_file_diff_unified_line(diff, 1, DT_SIDE_B) == -1);
+	CHECK(dt_file_diff_unified_line(diff, 2, DT_SIDE_A) == -1 && dt_file_diff_unified_line(diff, 2, DT_SIDE_B) == 1);
+	CHECK(dt_file_diff_unified_line(diff, 3, DT_SIDE_A) == 2 && dt_file_diff_unified_line(diff, 3, DT_SIDE_B) == 2);
+	CHECK(dt_file_diff_unified_line(diff, 99, DT_SIDE_A) == -1);
 
 	dt_file_diff_free(diff);
 	dt_comparison_free(cmp);

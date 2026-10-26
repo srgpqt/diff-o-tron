@@ -61,6 +61,8 @@ pub struct Hunk {
     pub rows: Range<u32>,
     pub a: Range<u32>,
     pub b: Range<u32>,
+    /// The hunk's rows in `FileDiff::unified`.
+    pub unified: Range<u32>,
 }
 
 #[derive(Debug, Default)]
@@ -106,6 +108,8 @@ pub struct FileDiff {
     pub b: Side,
     pub rows: Vec<Row>,
     pub hunks: Vec<Hunk>,
+    /// Rows of the unified view: unchanged lines with both sides, and changed lines with one.
+    pub unified: Vec<Row>,
     /// Both sides have exactly the same contents.
     pub identical: bool,
     pub error: Option<String>,
@@ -172,6 +176,32 @@ impl FileDiff {
         }
         let (a_len, b_len) = (self.a.text.lines.len() as u32, self.b.text.lines.len() as u32);
         self.push_equal(a..a_len, b..b_len);
+        self.push_unified();
+    }
+
+    /// Lay out the unified view. Within a hunk, each run of rows that pair changed lines shows
+    /// the run's A lines and then its B lines, and so does each run of unpaired lines.
+    fn push_unified(&mut self) {
+        let paired = |row: &Row| row.a.is_some_and(|a| self.a.kinds[a as usize] == LineKind::Changed);
+        let mut unified = Vec::with_capacity(self.rows.len());
+        let mut ranges = Vec::with_capacity(self.hunks.len());
+        let mut next = 0;
+        for hunk in &self.hunks {
+            let (start, end) = (hunk.rows.start as usize, hunk.rows.end as usize);
+            unified.extend_from_slice(&self.rows[next..start]);
+            let first = unified.len() as u32;
+            for run in self.rows[start..end].chunk_by(|x, y| paired(x) == paired(y)) {
+                unified.extend(run.iter().filter_map(|r| r.a).map(|a| Row { a: Some(a), b: None }));
+                unified.extend(run.iter().filter_map(|r| r.b).map(|b| Row { a: None, b: Some(b) }));
+            }
+            ranges.push(first..unified.len() as u32);
+            next = end;
+        }
+        unified.extend_from_slice(&self.rows[next..]);
+        for (hunk, range) in self.hunks.iter_mut().zip(ranges) {
+            hunk.unified = range;
+        }
+        self.unified = unified;
     }
 
     fn push_equal(&mut self, a: Range<u32>, b: Range<u32>) {
@@ -209,7 +239,7 @@ impl FileDiff {
         }
         self.push_unpaired(&mut minus, &mut plus);
 
-        self.hunks.push(Hunk { rows: first_row..self.rows.len() as u32, a, b });
+        self.hunks.push(Hunk { rows: first_row..self.rows.len() as u32, a, b, unified: 0..0 });
     }
 
     fn push_unpaired(&mut self, minus: &mut Vec<u32>, plus: &mut Vec<u32>) {
@@ -339,7 +369,13 @@ mod tests {
         assert_eq!(rows(&d), [(Some(0), Some(0)), (Some(1), None), (Some(2), Some(1)), (None, Some(2))]);
         assert_eq!(d.a.kinds, [LineKind::Equal, LineKind::Removed, LineKind::Equal]);
         assert_eq!(d.b.kinds, [LineKind::Equal, LineKind::Equal, LineKind::Added]);
-        assert_eq!(d.hunks, [Hunk { rows: 1..2, a: 1..2, b: 1..1 }, Hunk { rows: 3..4, a: 3..3, b: 2..3 }]);
+        assert_eq!(
+            d.hunks,
+            [
+                Hunk { rows: 1..2, a: 1..2, b: 1..1, unified: 1..2 },
+                Hunk { rows: 3..4, a: 3..3, b: 2..3, unified: 3..4 }
+            ]
+        );
     }
 
     #[test]
@@ -365,6 +401,42 @@ mod tests {
         assert_eq!(rows(&d), [(Some(0), Some(0)), (Some(1), Some(1)), (None, Some(2))]);
         assert_eq!(d.a.kinds[1], LineKind::Removed);
         assert_eq!(d.b.kinds[1], LineKind::Added);
+    }
+
+    fn unified(d: &FileDiff) -> Vec<(Option<u32>, Option<u32>)> {
+        d.unified.iter().map(|r| (r.a, r.b)).collect()
+    }
+
+    #[test]
+    fn unified_shows_runs_of_a_lines_then_b_lines() {
+        let d =
+            diff("same\nlet a = 1;\nlet b = 2;\ngone gone gone\nend\n", "same\nlet a = 10;\nlet b = 20;\nadded\nend\n");
+        // Two changed lines paired, then a removed line and an added one sharing a row.
+        assert_eq!(
+            rows(&d),
+            [(Some(0), Some(0)), (Some(1), Some(1)), (Some(2), Some(2)), (Some(3), Some(3)), (Some(4), Some(4))]
+        );
+        assert_eq!(d.a.kinds[3], LineKind::Removed);
+        assert_eq!(
+            unified(&d),
+            [
+                (Some(0), Some(0)),
+                (Some(1), None),
+                (Some(2), None),
+                (None, Some(1)),
+                (None, Some(2)),
+                (Some(3), None),
+                (None, Some(3)),
+                (Some(4), Some(4)),
+            ]
+        );
+        assert_eq!(d.hunks[0].unified, 1..7);
+    }
+
+    #[test]
+    fn unified_of_identical_files() {
+        let d = diff("a\nb\n", "a\nb\n");
+        assert_eq!(unified(&d), rows(&d));
     }
 
     #[test]

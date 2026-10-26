@@ -91,6 +91,7 @@ typedef struct {
 	uint32_t row_start, row_end;
 	uint32_t a_start, a_end;
 	uint32_t b_start, b_end;
+	uint32_t unified_start, unified_end; /* its rows in the unified view */
 } DtHunk;
 
 /*
@@ -117,6 +118,13 @@ uint32_t dt_file_diff_flags(const DtFileDiff *diff);
 size_t dt_file_diff_row_count(const DtFileDiff *diff);
 /* The index of the line a row shows on a side, or -1 for none. */
 int32_t dt_file_diff_row_line(const DtFileDiff *diff, size_t row, uint8_t side);
+/*
+ * Rows of the unified view: unchanged lines show both sides, and changed lines
+ * one. Within a hunk, each run of paired changed lines shows its A lines and
+ * then its B lines, and so does each run of unpaired lines.
+ */
+size_t dt_file_diff_unified_count(const DtFileDiff *diff);
+int32_t dt_file_diff_unified_line(const DtFileDiff *diff, size_t row, uint8_t side);
 size_t dt_file_diff_line_count(const DtFileDiff *diff, uint8_t side);
 DtLine dt_file_diff_line(const DtFileDiff *diff, uint8_t side, size_t index);
 size_t dt_file_diff_hunk_count(const DtFileDiff *diff);

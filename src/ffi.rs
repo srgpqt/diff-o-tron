@@ -6,7 +6,7 @@ use std::ffi::{CStr, c_char};
 use std::path::PathBuf;
 use std::ptr;
 
-use crate::diff::{FileDiff, Options, Side, Span};
+use crate::diff::{FileDiff, Options, Row, Side, Span};
 use crate::tree::{Comparison, Status};
 
 pub struct DtComparison(Comparison);
@@ -64,6 +64,8 @@ pub struct DtHunk {
     a_end: u32,
     b_start: u32,
     b_end: u32,
+    unified_start: u32,
+    unified_end: u32,
 }
 
 fn diff_side(diff: &DtFileDiff, side: u8) -> Option<&Side> {
@@ -186,12 +188,26 @@ pub extern "C" fn dt_file_diff_row_count(diff: &DtFileDiff) -> usize {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_file_diff_row_line(diff: &DtFileDiff, row: usize, side: u8) -> i32 {
-    let line = diff.0.rows.get(row).and_then(|r| match side {
+    row_line(diff.0.rows.get(row), side)
+}
+
+fn row_line(row: Option<&Row>, side: u8) -> i32 {
+    let line = row.and_then(|r| match side {
         0 => r.a,
         1 => r.b,
         _ => None,
     });
     line.map_or(-1, |l| l as i32)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_file_diff_unified_count(diff: &DtFileDiff) -> usize {
+    diff.0.unified.len()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_file_diff_unified_line(diff: &DtFileDiff, row: usize, side: u8) -> i32 {
+    row_line(diff.0.unified.get(row), side)
 }
 
 #[unsafe(no_mangle)]
@@ -230,6 +246,8 @@ pub extern "C" fn dt_file_diff_hunk(diff: &DtFileDiff, index: usize) -> DtHunk {
             a_end: h.a.end,
             b_start: h.b.start,
             b_end: h.b.end,
+            unified_start: h.unified.start,
+            unified_end: h.unified.end,
         },
         None => DtHunk::default(),
     }
