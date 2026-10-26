@@ -1,5 +1,5 @@
 /*
- * How the diffotron command (system/macos-cli.m) asks the app (system/macos.m)
+ * How the diffotron command (macOS/cli.m) asks the app (macOS/DiffDocumentController.m)
  * to compare files.
  *
  * The sandboxed app can only read files that Launch Services opens with it, so

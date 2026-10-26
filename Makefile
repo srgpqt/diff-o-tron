@@ -158,27 +158,26 @@ endif
 
 macos: $(BUILD)/macos.signed
 
-$(BUILD)/macos.o: system/macos.m
+# Every macOS/*.m goes into the app, except the diffotron command's.
+MACOS_APP_OBJECTS := $(patsubst macOS/%.m,$(BUILD)/macOS/%.o,$(filter-out macOS/cli.m,$(wildcard macOS/*.m)))
+
+$(BUILD)/macOS/%.o: macOS/%.m
 	@mkdir -p $(@D)
 	$(MACOS_CC) $(MACOS_FLAGS) $(CFLAGS) -fobjc-arc -MMD -MP -c -o $@ $<
 
-$(MACOS_BIN): $(BUILD)/macos.o $(RUST_LIB)
+$(MACOS_BIN): $(MACOS_APP_OBJECTS) $(RUST_LIB)
 	@mkdir -p $(@D)
 	$(MACOS_CC) $(MACOS_FLAGS) $(MACOS_LDFLAGS) -o $@ $^ -framework Cocoa -framework CoreServices -framework CoreText $(RUST_LIBS_macos)
 
-$(BUILD)/macos-cli.o: system/macos-cli.m
-	@mkdir -p $(@D)
-	$(MACOS_CC) $(MACOS_FLAGS) $(CFLAGS) -fobjc-arc -MMD -MP -c -o $@ $<
-
-$(MACOS_CLI): $(BUILD)/macos-cli.o
+$(MACOS_CLI): $(BUILD)/macOS/cli.o
 	@mkdir -p $(@D)
 	$(MACOS_CC) $(MACOS_FLAGS) $(MACOS_LDFLAGS) -o $@ $^ -framework Cocoa
 
-$(APP)/Contents/Info.plist: system/macos.plist Makefile
+$(APP)/Contents/Info.plist: macOS/Info.plist Makefile
 	@mkdir -p $(@D)
 	sed -e 's/@APP_VERSION@/$(APP_VERSION)/' -e 's/@APP_BUILD@/$(APP_BUILD)/' -e 's/@MACOS_MIN@/$(MACOS_MIN)/' $< > $@
 
-$(APP)/Contents/Resources/Credits.html: system/credits.html
+$(APP)/Contents/Resources/Credits.html: macOS/credits.html
 	@mkdir -p $(@D)
 	cp $< $@
 
@@ -205,7 +204,7 @@ run-macos: macos
 
 WINDOWS_SDK ?= missing_windows_sdk
 WINDOWS_EXE := $(BUILD)/$(APP_NAME).exe
-WINDOWS_RC  := $(wildcard system/windows.rc)
+WINDOWS_RC  := $(wildcard Windows/main.rc)
 
 ifeq ($(PLATFORM),windows)
   ifneq ($(HOST_PLATFORM),windows)
@@ -242,16 +241,16 @@ WINDOWS_LDFLAGS := \
 
 windows: $(WINDOWS_EXE)
 
-$(BUILD)/windows.o: system/windows.c
+$(BUILD)/Windows/main.o: Windows/main.c
 	@mkdir -p $(@D)
 	clang $(WINDOWS_CFLAGS) -MMD -MP -c -o $@ $<
 
-$(BUILD)/windows.rc.o: $(WINDOWS_RC) entitlements/windows.xml
+$(BUILD)/Windows/main.rc.o: $(WINDOWS_RC) entitlements/windows.xml
 	@mkdir -p $(@D)
-	llvm-rc /FO $(BUILD)/windows.rc.res $<
-	llvm-cvtres /OUT:$@ /MACHINE:X64 $(BUILD)/windows.rc.res
+	llvm-rc /FO $(BUILD)/Windows/main.rc.res $<
+	llvm-cvtres /OUT:$@ /MACHINE:X64 $(BUILD)/Windows/main.rc.res
 
-$(WINDOWS_EXE): $(BUILD)/windows.o $(if $(WINDOWS_RC),$(BUILD)/windows.rc.o) $(RUST_LIB)
+$(WINDOWS_EXE): $(BUILD)/Windows/main.o $(if $(WINDOWS_RC),$(BUILD)/Windows/main.rc.o) $(RUST_LIB)
 	clang -o $@ $^ $(WINDOWS_LDFLAGS)
 
 run-windows: windows
@@ -268,11 +267,11 @@ LINUX_PKG_LIBS   := $(if $(LINUX_PKGS),$(shell pkg-config --libs $(LINUX_PKGS)))
 
 linux: $(LINUX_BIN)
 
-$(BUILD)/linux.o: system/linux.c
+$(BUILD)/Linux/main.o: Linux/main.c
 	@mkdir -p $(@D)
 	$(LINUX_CC) $(CFLAGS) $(LINUX_PKG_CFLAGS) -MMD -MP -c -o $@ $<
 
-$(LINUX_BIN): $(BUILD)/linux.o $(RUST_LIB)
+$(LINUX_BIN): $(BUILD)/Linux/main.o $(RUST_LIB)
 	$(LINUX_CC) -o $@ $^ $(LINUX_PKG_LIBS) $(RUST_LIBS_linux)
 
 run-linux: linux
@@ -294,7 +293,7 @@ check-credits:
 	@status=0; \
 	for crate in $$($(CARGO) tree -e normal --prefix none --target all | awk '{ print $$1 }' | sort -u); do \
 		[ "$$crate" = diffotron ] && continue; \
-		grep -q "<h3>$$crate</h3>" system/credits.html || { echo "system/credits.html doesn't credit $$crate"; status=1; }; \
+		grep -q "<h3>$$crate</h3>" macOS/credits.html || { echo "macOS/credits.html doesn't credit $$crate"; status=1; }; \
 	done; \
 	exit $$status
 
@@ -316,4 +315,4 @@ clean:
 .PHONY: all run test check-credits clean macos run-macos windows run-windows linux run-linux FORCE
 FORCE:
 
--include $(wildcard $(BUILD)/*.d $(HOST_BUILD)/*.d)
+-include $(wildcard $(BUILD)/*.d $(BUILD)/*/*.d $(HOST_BUILD)/*.d)

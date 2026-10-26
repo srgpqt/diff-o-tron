@@ -6,7 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-#include "macos-request.h"
+#include "request.h"
 
 /*
  * The diffotron command, installed in Diff-o-tron.app/Contents/Helpers: opens
