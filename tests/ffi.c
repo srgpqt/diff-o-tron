@@ -86,8 +86,12 @@ int main(int argc, char **argv) {
 	CHECK(dt_file_diff_hunk_count(diff) == 2);
 	DtHunk hunk = dt_file_diff_hunk(diff, 1);
 	CHECK(hunk.row_start == 3 && hunk.row_end == 4);
-	CHECK(hunk.a_start == 3 && hunk.a_end == 3);
-	CHECK(hunk.b_start == 3 && hunk.b_end == 4);
+	CHECK(hunk.start[DT_SIDE_A] == 3 && hunk.end[DT_SIDE_A] == 3);
+	CHECK(hunk.start[DT_SIDE_B] == 3 && hunk.end[DT_SIDE_B] == 4);
+	CHECK(hunk.kind == DT_HUNK_ADDED);
+	CHECK(dt_file_diff_hunk(diff, 0).kind == DT_HUNK_CHANGED);
+	CHECK(dt_file_diff_side_count(diff) == 2);
+	CHECK(dt_merge_chunk_count(diff) == 0);
 	/* one, the changed line on side A then on side B, three, four */
 	CHECK(hunk.unified_start == 4 && hunk.unified_end == 5);
 	CHECK(dt_file_diff_unified_count(diff) == 5);
@@ -103,6 +107,34 @@ int main(int argc, char **argv) {
 	CHECK(dt_comparison_error(cmp).len > 0);
 	CHECK(dt_comparison_count(cmp) == 0);
 	dt_comparison_free(cmp);
+
+	/* A merge: line two changed differently on each side, line three only in B. */
+	char path_base[4096];
+	snprintf(path_base, sizeof path_base, "%s/base.txt", argv[1]);
+	write_file(path_base, "one\ntwo\nthree\nfour\nfive\n");
+	write_file(path_a, "one\nTWO\nthree\nfour\nfive\n");
+	write_file(path_b, "one\n2\nthree\nfour\n5\n");
+	DtFileDiff *merge = dt_merge_new(path_base, path_a, path_b, options);
+	CHECK(dt_file_diff_error(merge).len == 0);
+	CHECK(dt_file_diff_side_count(merge) == 3);
+	CHECK(dt_file_diff_unified_count(merge) == 0);
+	CHECK(dt_file_diff_row_count(merge) == 5);
+	CHECK(dt_file_diff_hunk_count(merge) == 2);
+	DtHunk conflict = dt_file_diff_hunk(merge, 0);
+	CHECK(conflict.kind == DT_HUNK_CONFLICT);
+	CHECK(conflict.start[DT_MERGE_BASE] == 1 && conflict.end[DT_MERGE_BASE] == 2);
+	CHECK(conflict.start[DT_MERGE_B] == 1 && conflict.end[DT_MERGE_B] == 2);
+	CHECK(dt_file_diff_hunk(merge, 1).kind == DT_HUNK_CHANGED);
+
+	CHECK(dt_merge_chunk_count(merge) == 4);
+	DtMergeChunk chunk = dt_merge_chunk(merge, 1);
+	CHECK(chunk.kind == DT_CHUNK_CONFLICT && chunk.hunk == 0);
+	CHECK(dt_merge_chunk(merge, 2).kind == DT_CHUNK_UNCHANGED && dt_merge_chunk(merge, 2).hunk == -1);
+	CHECK(dt_merge_chunk(merge, 3).kind == DT_CHUNK_CHANGED_IN_B && dt_merge_chunk(merge, 3).hunk == 1);
+	CHECK(str_eq(dt_merge_chunk_text(merge, 1, DT_VERSION_A), "TWO\n"));
+	CHECK(str_eq(dt_merge_chunk_text(merge, 1, DT_VERSION_MERGED), "<<<<<<< A\nTWO\n=======\n2\n>>>>>>> B\n"));
+	CHECK(str_eq(dt_merge_chunk_text(merge, 3, DT_VERSION_MERGED), "5\n"));
+	dt_file_diff_free(merge);
 
 	if (failures) {
 		fprintf(stderr, "%d check(s) failed\n", failures);

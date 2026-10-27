@@ -6,11 +6,20 @@ use std::ffi::{CStr, c_char};
 use std::path::PathBuf;
 use std::ptr;
 
-use crate::diff::{FileDiff, Options, Row, Side, Span};
+use crate::diff::{FileDiff, LineKind, Options, Side, Span};
+use crate::merge::{self, ChunkKind, Merge};
 use crate::tree::{Comparison, Status};
 
 pub struct DtComparison(Comparison);
-pub struct DtFileDiff(FileDiff);
+
+/// A diff of two files, or a merge of three.
+pub struct DtFileDiff(Diff);
+
+enum Diff {
+    Files(FileDiff),
+    /// With the index of each hunk's chunk: hunks are the chunks that aren't unchanged.
+    Merge(Merge, Vec<usize>),
+}
 
 #[repr(C)]
 pub struct DtStr {
@@ -40,10 +49,22 @@ const DT_IGNORE_WHITESPACE: u32 = 1 << 0;
 const DT_DIFF_IDENTICAL: u32 = 1 << 0;
 const DT_DIFF_BINARY: u32 = 1 << 1;
 
+const DT_MAX_SIDES: usize = 3;
+const DT_HUNK_CHANGED: u8 = LineKind::Changed as u8;
+const DT_HUNK_REMOVED: u8 = LineKind::Removed as u8;
+const DT_HUNK_ADDED: u8 = LineKind::Added as u8;
+const DT_HUNK_CONFLICT: u8 = 4;
+
 #[repr(C)]
 pub struct DtDiffOptions {
     flags: u32,
     tab_width: u32,
+}
+
+impl DtDiffOptions {
+    fn options(&self) -> Options {
+        Options { ignore_whitespace: self.flags & DT_IGNORE_WHITESPACE != 0, tab_width: self.tab_width }
+    }
 }
 
 #[repr(C)]
@@ -60,18 +81,112 @@ pub struct DtLine {
 pub struct DtHunk {
     row_start: u32,
     row_end: u32,
-    a_start: u32,
-    a_end: u32,
-    b_start: u32,
-    b_end: u32,
     unified_start: u32,
     unified_end: u32,
+    start: [u32; DT_MAX_SIDES],
+    end: [u32; DT_MAX_SIDES],
+    kind: u8,
 }
 
-fn diff_side(diff: &DtFileDiff, side: u8) -> Option<&Side> {
+#[repr(C)]
+pub struct DtMergeChunk {
+    kind: u8,
+    hunk: i32,
+}
+
+/// How a hunk is colored: by its lines on the side before the change and the side after.
+fn hunk_kind(before: &std::ops::Range<u32>, after: &std::ops::Range<u32>) -> u8 {
+    if before.is_empty() {
+        DT_HUNK_ADDED
+    } else if after.is_empty() {
+        DT_HUNK_REMOVED
+    } else {
+        DT_HUNK_CHANGED
+    }
+}
+
+impl Diff {
+    fn side(&self, side: u8) -> Option<&Side> {
+        match self {
+            Diff::Files(diff) => match side {
+                0 => Some(&diff.a),
+                1 => Some(&diff.b),
+                _ => None,
+            },
+            Diff::Merge(merge, _) => merge.sides.get(side as usize),
+        }
+    }
+
+    fn error(&self) -> &Option<String> {
+        match self {
+            Diff::Files(diff) => &diff.error,
+            Diff::Merge(merge, _) => &merge.error,
+        }
+    }
+
+    fn row_count(&self) -> usize {
+        match self {
+            Diff::Files(diff) => diff.rows.len(),
+            Diff::Merge(merge, _) => merge.rows.len(),
+        }
+    }
+
+    fn row_line(&self, row: usize, side: u8) -> i32 {
+        let line = match self {
+            Diff::Files(diff) => diff.rows.get(row).and_then(|r| two_way_line(r.a, r.b, side)),
+            Diff::Merge(merge, _) => merge.rows.get(row).and_then(|r| r.get(side as usize).copied().flatten()),
+        };
+        line.map_or(-1, |l| l as i32)
+    }
+
+    fn hunk_count(&self) -> usize {
+        match self {
+            Diff::Files(diff) => diff.hunks.len(),
+            Diff::Merge(_, hunks) => hunks.len(),
+        }
+    }
+
+    fn hunk(&self, index: usize) -> DtHunk {
+        match self {
+            Diff::Files(diff) => match diff.hunks.get(index) {
+                Some(h) => DtHunk {
+                    row_start: h.rows.start,
+                    row_end: h.rows.end,
+                    unified_start: h.unified.start,
+                    unified_end: h.unified.end,
+                    start: [h.a.start, h.b.start, 0],
+                    end: [h.a.end, h.b.end, 0],
+                    kind: hunk_kind(&h.a, &h.b),
+                },
+                None => DtHunk::default(),
+            },
+            Diff::Merge(merge, hunks) => match hunks.get(index).map(|&c| &merge.chunks[c]) {
+                Some(chunk) => {
+                    let changed = if chunk.kind == ChunkKind::ChangedInB { merge::B } else { merge::A };
+                    DtHunk {
+                        row_start: chunk.rows.start,
+                        row_end: chunk.rows.end,
+                        unified_start: 0,
+                        unified_end: 0,
+                        start: chunk.lines.clone().map(|r| r.start),
+                        end: chunk.lines.clone().map(|r| r.end),
+                        kind: if chunk.kind == ChunkKind::Conflict {
+                            DT_HUNK_CONFLICT
+                        } else {
+                            hunk_kind(&chunk.lines[merge::BASE], &chunk.lines[changed])
+                        },
+                    }
+                }
+                None => DtHunk::default(),
+            },
+        }
+    }
+}
+
+fn two_way_line(a: Option<u32>, b: Option<u32>, side: u8) -> Option<u32> {
     match side {
-        0 => Some(&diff.0.a),
-        1 => Some(&diff.0.b),
+        0 => a,
+        1 => b,
         _ => None,
     }
 }
@@ -146,17 +261,30 @@ pub extern "C" fn dt_comparison_entry_path(cmp: &DtComparison, index: usize, sid
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_file_diff_new(cmp: &DtComparison, index: usize, options: DtDiffOptions) -> *mut DtFileDiff {
-    let options =
-        Options { ignore_whitespace: options.flags & DT_IGNORE_WHITESPACE != 0, tab_width: options.tab_width };
     let diff = match cmp.0.entries.get(index) {
-        Some(e) => FileDiff::load(e.a.as_deref(), e.b.as_deref(), options),
+        Some(e) => FileDiff::load(e.a.as_deref(), e.b.as_deref(), options.options()),
         None => FileDiff { error: Some(format!("No entry {index}")), ..FileDiff::default() },
     };
-    Box::into_raw(Box::new(DtFileDiff(diff)))
+    Box::into_raw(Box::new(DtFileDiff(Diff::Files(diff))))
 }
 
 /// # Safety
-/// `diff` must come from `dt_file_diff_new` and not be used afterwards, or be null.
+/// The paths must be NUL-terminated strings, or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dt_merge_new(
+    base: *const c_char,
+    a: *const c_char,
+    b: *const c_char,
+    options: DtDiffOptions,
+) -> *mut DtFileDiff {
+    let (base, a, b) = unsafe { (path_from_c(base), path_from_c(a), path_from_c(b)) };
+    let merge = Merge::load(&base, &a, &b, options.options());
+    let hunks = (0..merge.chunks.len()).filter(|&c| merge.chunks[c].kind != ChunkKind::Unchanged).collect();
+    Box::into_raw(Box::new(DtFileDiff(Diff::Merge(merge, hunks))))
+}
+
+/// # Safety
+/// `diff` must come from `dt_file_diff_new` or `dt_merge_new` and not be used afterwards, or be null.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dt_file_diff_free(diff: *mut DtFileDiff) {
     if !diff.is_null() {
@@ -166,58 +294,66 @@ pub unsafe extern "C" fn dt_file_diff_free(diff: *mut DtFileDiff) {
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_file_diff_error(diff: &DtFileDiff) -> DtStr {
-    error_str(&diff.0.error)
+    error_str(diff.0.error())
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_file_diff_flags(diff: &DtFileDiff) -> u32 {
     let mut flags = 0;
-    if diff.0.identical {
-        flags |= DT_DIFF_IDENTICAL;
-    }
-    if diff.0.binary() {
-        flags |= DT_DIFF_BINARY;
+    if let Diff::Files(diff) = &diff.0 {
+        if diff.identical {
+            flags |= DT_DIFF_IDENTICAL;
+        }
+        if diff.binary() {
+            flags |= DT_DIFF_BINARY;
+        }
     }
     flags
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn dt_file_diff_side_count(diff: &DtFileDiff) -> usize {
+    match diff.0 {
+        Diff::Files(_) => 2,
+        Diff::Merge(..) => 3,
+    }
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn dt_file_diff_row_count(diff: &DtFileDiff) -> usize {
-    diff.0.rows.len()
+    diff.0.row_count()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_file_diff_row_line(diff: &DtFileDiff, row: usize, side: u8) -> i32 {
-    row_line(diff.0.rows.get(row), side)
-}
-
-fn row_line(row: Option<&Row>, side: u8) -> i32 {
-    let line = row.and_then(|r| match side {
-        0 => r.a,
-        1 => r.b,
-        _ => None,
-    });
-    line.map_or(-1, |l| l as i32)
+    diff.0.row_line(row, side)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_file_diff_unified_count(diff: &DtFileDiff) -> usize {
-    diff.0.unified.len()
+    match &diff.0 {
+        Diff::Files(diff) => diff.unified.len(),
+        Diff::Merge(..) => 0,
+    }
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_file_diff_unified_line(diff: &DtFileDiff, row: usize, side: u8) -> i32 {
-    row_line(diff.0.unified.get(row), side)
+    let line = match &diff.0 {
+        Diff::Files(diff) => diff.unified.get(row).and_then(|r| two_way_line(r.a, r.b, side)),
+        Diff::Merge(..) => None,
+    };
+    line.map_or(-1, |l| l as i32)
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_file_diff_line_count(diff: &DtFileDiff, side: u8) -> usize {
-    diff_side(diff, side).map_or(0, |s| s.text.lines.len())
+    diff.0.side(side).map_or(0, |s| s.text.lines.len())
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_file_diff_line(diff: &DtFileDiff, side: u8, index: usize) -> DtLine {
-    let side = match diff_side(diff, side) {
+    let side = match diff.0.side(side) {
         Some(side) if index < side.text.lines.len() => side,
         _ => return DtLine { text: DtStr::empty(), columns: 0, kind: 0, span_count: 0, spans: ptr::null() },
     };
@@ -233,22 +369,40 @@ pub extern "C" fn dt_file_diff_line(diff: &DtFileDiff, side: u8, index: usize) -
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_file_diff_hunk_count(diff: &DtFileDiff) -> usize {
-    diff.0.hunks.len()
+    diff.0.hunk_count()
 }
 
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_file_diff_hunk(diff: &DtFileDiff, index: usize) -> DtHunk {
-    match diff.0.hunks.get(index) {
-        Some(h) => DtHunk {
-            row_start: h.rows.start,
-            row_end: h.rows.end,
-            a_start: h.a.start,
-            a_end: h.a.end,
-            b_start: h.b.start,
-            b_end: h.b.end,
-            unified_start: h.unified.start,
-            unified_end: h.unified.end,
+    diff.0.hunk(index)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_merge_chunk_count(diff: &DtFileDiff) -> usize {
+    match &diff.0 {
+        Diff::Files(_) => 0,
+        Diff::Merge(merge, _) => merge.chunks.len(),
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_merge_chunk(diff: &DtFileDiff, index: usize) -> DtMergeChunk {
+    match &diff.0 {
+        Diff::Merge(merge, hunks) if index < merge.chunks.len() => DtMergeChunk {
+            kind: merge.chunks[index].kind as u8,
+            hunk: hunks.iter().position(|&c| c == index).map_or(-1, |h| h as i32),
         },
-        None => DtHunk::default(),
+        _ => DtMergeChunk { kind: ChunkKind::Unchanged as u8, hunk: -1 },
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_merge_chunk_text(diff: &DtFileDiff, index: usize, version: u8) -> DtStr {
+    match &diff.0 {
+        Diff::Merge(merge, _) => match merge.texts.get(index).and_then(|t| t.get(version as usize)) {
+            Some(text) => DtStr::new(text),
+            None => DtStr::empty(),
+        },
+        Diff::Files(_) => DtStr::empty(),
     }
 }

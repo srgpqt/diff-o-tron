@@ -38,16 +38,26 @@ enum {
 	DT_LINE_CHANGED = 1, /* paired with a similar line on the other side */
 	DT_LINE_REMOVED = 2, /* only on side A */
 	DT_LINE_ADDED = 3,   /* only on side B */
+	DT_LINE_CONFLICT = 4, /* in a merge, a line of a conflict: changed differently on each side */
 };
 
 /*
- * Sides of a comparison. Functions taking a side are indexed so that more
- * sides (a merge base and result) can be added later.
+ * Sides of a diff of two files. Functions taking a side take any of a diff's
+ * sides: see dt_file_diff_side_count.
  */
 enum {
 	DT_SIDE_A = 0,
 	DT_SIDE_B = 1,
 };
+
+/* Sides of a merge of three files, in the order they're shown. */
+enum {
+	DT_MERGE_BASE = 0,
+	DT_MERGE_A = 1,
+	DT_MERGE_B = 2,
+};
+
+#define DT_MAX_SIDES 3
 
 /* DtDiffOptions.flags */
 enum {
@@ -86,16 +96,52 @@ typedef struct {
 	const DtSpan *spans;
 } DtLine;
 
+/* DtHunk.kind */
+enum {
+	DT_HUNK_CHANGED = 1,  /* lines changed, the same values as DT_LINE_* */
+	DT_HUNK_REMOVED = 2,  /* lines only removed */
+	DT_HUNK_ADDED = 3,    /* lines only added */
+	DT_HUNK_CONFLICT = 4, /* in a merge, lines changed differently on each side */
+};
+
 /*
- * A change: consecutive rows of changed lines that are either all paired with
- * similar lines on the other side, or all unpaired. Ranges are half-open.
+ * A change. In a diff of two files: consecutive rows of changed lines that are
+ * either all paired with similar lines on the other side, or all unpaired. In
+ * a merge: a chunk that isn't unchanged. Ranges are half-open.
  */
 typedef struct {
 	uint32_t row_start, row_end;
-	uint32_t a_start, a_end;
-	uint32_t b_start, b_end;
-	uint32_t unified_start, unified_end; /* its rows in the unified view */
+	uint32_t unified_start, unified_end; /* its rows in the unified view, of a diff of two files */
+	uint32_t start[DT_MAX_SIDES], end[DT_MAX_SIDES]; /* its lines on each side */
+	uint8_t kind;
 } DtHunk;
+
+/* DtMergeChunk.kind */
+enum {
+	DT_CHUNK_UNCHANGED = 0,
+	DT_CHUNK_CHANGED_IN_A = 1,
+	DT_CHUNK_CHANGED_IN_B = 2,
+	DT_CHUNK_CHANGED_IN_BOTH = 3, /* the same way */
+	DT_CHUNK_CONFLICT = 4,        /* differently */
+};
+
+/* A run of a merge: lines unchanged on both sides, or changed on either or both. */
+typedef struct {
+	uint8_t kind;
+	int32_t hunk; /* the change it is, or -1 if it's unchanged */
+} DtMergeChunk;
+
+/* Versions of a merge chunk's text, from dt_merge_chunk_text. */
+enum {
+	DT_VERSION_BASE = 0,
+	DT_VERSION_A = 1,
+	DT_VERSION_B = 2,
+	/*
+	 * What the merged result starts with: the change from whichever side made
+	 * one, or for a conflict, both sides between git's conflict markers.
+	 */
+	DT_VERSION_MERGED = 3,
+};
 
 /*
  * Compare two paths, each a file or a directory, given as NUL-terminated UTF-8.
@@ -114,17 +160,26 @@ DtStr dt_comparison_entry_path(const DtComparison *cmp, size_t index, uint8_t si
 
 /* Diff the files of an entry. Never returns NULL. */
 DtFileDiff *dt_file_diff_new(const DtComparison *cmp, size_t index, DtDiffOptions options);
+/*
+ * Merge two changed versions of a file, A and B, against their common base,
+ * given as NUL-terminated UTF-8 paths. Its sides are DT_MERGE_*. Never returns
+ * NULL.
+ */
+DtFileDiff *dt_merge_new(const char *base, const char *a, const char *b, DtDiffOptions options);
 void dt_file_diff_free(DtFileDiff *diff);
 DtStr dt_file_diff_error(const DtFileDiff *diff); /* empty if none */
 uint32_t dt_file_diff_flags(const DtFileDiff *diff);
+/* 2 for a diff of two files, 3 for a merge. */
+size_t dt_file_diff_side_count(const DtFileDiff *diff);
 /* Rows of the side-by-side view, each showing a line from one or more sides. */
 size_t dt_file_diff_row_count(const DtFileDiff *diff);
 /* The index of the line a row shows on a side, or -1 for none. */
 int32_t dt_file_diff_row_line(const DtFileDiff *diff, size_t row, uint8_t side);
 /*
- * Rows of the unified view: unchanged lines show both sides, and changed lines
- * one. Within a hunk, each run of paired changed lines shows its A lines and
- * then its B lines, and so does each run of unpaired lines.
+ * Rows of the unified view of a diff of two files, none for a merge: unchanged
+ * lines show both sides, and changed lines one. Within a hunk, each run of
+ * paired changed lines shows its A lines and then its B lines, and so does
+ * each run of unpaired lines.
  */
 size_t dt_file_diff_unified_count(const DtFileDiff *diff);
 int32_t dt_file_diff_unified_line(const DtFileDiff *diff, size_t row, uint8_t side);
@@ -132,6 +187,14 @@ size_t dt_file_diff_line_count(const DtFileDiff *diff, uint8_t side);
 DtLine dt_file_diff_line(const DtFileDiff *diff, uint8_t side, size_t index);
 size_t dt_file_diff_hunk_count(const DtFileDiff *diff);
 DtHunk dt_file_diff_hunk(const DtFileDiff *diff, size_t index);
+
+/*
+ * A merge's chunks, in order, none for a diff of two files. Each chunk's texts
+ * in a version, put together, make that version of the file.
+ */
+size_t dt_merge_chunk_count(const DtFileDiff *diff);
+DtMergeChunk dt_merge_chunk(const DtFileDiff *diff, size_t index);
+DtStr dt_merge_chunk_text(const DtFileDiff *diff, size_t index, uint8_t version);
 
 #ifdef __cplusplus
 }

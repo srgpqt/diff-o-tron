@@ -34,6 +34,8 @@ pub enum LineKind {
     Removed = 2,
     /// Only on side B.
     Added = 3,
+    /// In a merge, a line of a conflict: changed differently on each side.
+    Conflict = 4,
 }
 
 /// A run of a line that differs from its paired line.
@@ -77,7 +79,7 @@ pub struct Side {
 }
 
 impl Side {
-    fn new(text: Text, tab_width: u32) -> Side {
+    pub(crate) fn new(text: Text, tab_width: u32) -> Side {
         let n = text.lines.len();
         let columns = (0..n).map(|i| text::columns(text.line(i), tab_width)).collect();
         Side { text, kinds: vec![LineKind::Equal; n], columns, line_spans: vec![0..0; n], spans: Vec::new() }
@@ -88,7 +90,7 @@ impl Side {
         &self.spans[r.start as usize..r.end as usize]
     }
 
-    fn set_spans(&mut self, line: usize, emph: &[Range<usize>]) {
+    pub(crate) fn set_spans(&mut self, line: usize, emph: &[Range<usize>]) {
         let text = self.text.line(line);
         let start = self.spans.len() as u32;
         for r in emph {
@@ -149,31 +151,11 @@ impl FileDiff {
     }
 
     fn compute(&mut self, options: Options) {
-        let line_diff = if options.ignore_whitespace {
-            let mut input = InternedInput {
-                before: Vec::new(),
-                after: Vec::new(),
-                interner: Interner::new(self.a.text.lines.len() + self.b.text.lines.len()),
-            };
-            input.update_before(self.a.text.raw_lines().map(strip_whitespace));
-            input.update_after(self.b.text.raw_lines().map(strip_whitespace));
-            let mut diff = Diff::compute(Algorithm::Histogram, &input);
-            diff.postprocess_no_heuristic(&input);
-            diff
-        } else {
-            let mut input = InternedInput::default();
-            input.update_before(self.a.text.raw_lines());
-            input.update_after(self.b.text.raw_lines());
-            let mut diff = Diff::compute(Algorithm::Histogram, &input);
-            diff.postprocess_lines(&input);
-            diff
-        };
-
         let (mut a, mut b) = (0, 0);
-        for hunk in line_diff.hunks() {
-            self.push_equal(a..hunk.before.start, b..hunk.after.start);
-            self.push_hunk(hunk.before.clone(), hunk.after.clone());
-            (a, b) = (hunk.before.end, hunk.after.end);
+        for (before, after) in line_hunks(&self.a.text, &self.b.text, options.ignore_whitespace) {
+            self.push_equal(a..before.start, b..after.start);
+            self.push_hunk(before.clone(), after.clone());
+            (a, b) = (before.end, after.end);
         }
         let (a_len, b_len) = (self.a.text.lines.len() as u32, self.b.text.lines.len() as u32);
         self.push_equal(a..a_len, b..b_len);
@@ -211,33 +193,9 @@ impl FileDiff {
 
     fn push_hunk(&mut self, a: Range<u32>, b: Range<u32>) {
         let first_row = self.rows.len() as u32;
-        for i in a.clone() {
-            self.a.kinds[i as usize] = LineKind::Removed;
-        }
-        for i in b.clone() {
-            self.b.kinds[i as usize] = LineKind::Added;
-        }
-
-        let alignment = if a.len() * b.len() <= MAX_INFERENCE_PAIRS {
-            self.infer_edits(a.clone(), b.clone())
-        } else {
-            a.clone().map(|i| (Some(i), None)).chain(b.clone().map(|i| (None, Some(i)))).collect()
-        };
-
-        // delta gives unpaired lines rows of their own; share rows between runs of them instead.
-        let (mut minus, mut plus) = (Vec::new(), Vec::new());
-        for (m, p) in alignment {
-            match (m, p) {
-                (Some(_), Some(_)) => {
-                    self.push_unpaired(&mut minus, &mut plus);
-                    self.rows.push(Row { a: m, b: p });
-                }
-                (Some(m), None) => minus.push(m),
-                (None, Some(p)) => plus.push(p),
-                (None, None) => {}
-            }
-        }
-        self.push_unpaired(&mut minus, &mut plus);
+        let pairing = Pairing::infer(&self.a, a.clone(), &self.b, b.clone());
+        pairing.apply(&mut self.a, &mut self.b);
+        self.rows.extend(pairing.rows().into_iter().map(|(a, b)| Row { a, b }));
 
         // A hunk of the line diff for each run of paired rows and each run of unpaired rows.
         let (mut row, mut a_next, mut b_next) = (first_row, a.start, b.start);
@@ -262,18 +220,46 @@ impl FileDiff {
     fn paired(&self, row: &Row) -> bool {
         row.a.is_some_and(|a| self.a.kinds[a as usize] == LineKind::Changed)
     }
+}
 
-    fn push_unpaired(&mut self, minus: &mut Vec<u32>, plus: &mut Vec<u32>) {
-        for i in 0..minus.len().max(plus.len()) {
-            self.rows.push(Row { a: minus.get(i).copied(), b: plus.get(i).copied() });
-        }
-        minus.clear();
-        plus.clear();
-    }
+/// The hunks of a line diff from `a` to `b`: pairs of line ranges.
+pub(crate) fn line_hunks(a: &Text, b: &Text, ignore_whitespace: bool) -> Vec<(Range<u32>, Range<u32>)> {
+    let diff = if ignore_whitespace {
+        let mut input = InternedInput {
+            before: Vec::new(),
+            after: Vec::new(),
+            interner: Interner::new(a.lines.len() + b.lines.len()),
+        };
+        input.update_before(a.raw_lines().map(strip_whitespace));
+        input.update_after(b.raw_lines().map(strip_whitespace));
+        let mut diff = Diff::compute(Algorithm::Histogram, &input);
+        diff.postprocess_no_heuristic(&input);
+        diff
+    } else {
+        let mut input = InternedInput::default();
+        input.update_before(a.raw_lines());
+        input.update_after(b.raw_lines());
+        let mut diff = Diff::compute(Algorithm::Histogram, &input);
+        diff.postprocess_lines(&input);
+        diff
+    };
+    diff.hunks().map(|h| (h.before, h.after)).collect()
+}
 
-    /// Pair up similar lines with delta and record their differences.
-    /// Returns delta's alignment, in absolute line numbers.
-    fn infer_edits(&mut self, a: Range<u32>, b: Range<u32>) -> Vec<(Option<u32>, Option<u32>)> {
+/// A pair of similar lines, each with its changed parts: a line of side A, then of side B.
+type Pair = (usize, Vec<Range<usize>>, usize, Vec<Range<usize>>);
+
+/// delta's pairing of the similar lines of a hunk: its alignment of the lines, and the changed
+/// parts of each pair. Line numbers are absolute.
+pub(crate) struct Pairing {
+    a: Range<u32>,
+    b: Range<u32>,
+    alignment: Vec<(Option<u32>, Option<u32>)>,
+    pairs: Vec<Pair>,
+}
+
+impl Pairing {
+    pub(crate) fn infer(a_side: &Side, a: Range<u32>, b_side: &Side, b: Range<u32>) -> Pairing {
         #[derive(Clone, Copy, Debug, PartialEq)]
         enum Op {
             MinusNoop,
@@ -282,12 +268,17 @@ impl FileDiff {
             Insertion,
         }
 
+        if a.len() * b.len() > MAX_INFERENCE_PAIRS {
+            let alignment = a.clone().map(|i| (Some(i), None)).chain(b.clone().map(|i| (None, Some(i)))).collect();
+            return Pairing { a, b, alignment, pairs: Vec::new() };
+        }
+
         let minus_lines: Vec<&str> =
-            a.clone().map(|i| truncate(self.a.text.line(i as usize), MAX_INFERENCE_LINE_LEN)).collect();
+            a.clone().map(|i| truncate(a_side.text.line(i as usize), MAX_INFERENCE_LINE_LEN)).collect();
         let plus_lines: Vec<&str> =
-            b.clone().map(|i| truncate(self.b.text.line(i as usize), MAX_INFERENCE_LINE_LEN)).collect();
+            b.clone().map(|i| truncate(b_side.text.line(i as usize), MAX_INFERENCE_LINE_LEN)).collect();
         let (minus_len, plus_len) = (minus_lines.len(), plus_lines.len());
-        let (annotated_minus, annotated_plus, alignment) = edits::infer_edits(
+        let (annotated_minus, annotated_plus, delta_alignment) = edits::infer_edits(
             minus_lines,
             plus_lines,
             vec![Op::MinusNoop; minus_len],
@@ -301,28 +292,74 @@ impl FileDiff {
 
         // delta emits annotated lines in the order of the alignment.
         let (mut minus_iter, mut plus_iter) = (annotated_minus.iter(), annotated_plus.iter());
-        let mut result = Vec::with_capacity(alignment.len());
-        let mut paired = Vec::new();
-        for &(m, p) in &alignment {
+        let mut alignment = Vec::with_capacity(delta_alignment.len());
+        let mut pairs = Vec::new();
+        for &(m, p) in &delta_alignment {
             let m = m.map(|m| a.start + m as u32);
             let p = p.map(|p| b.start + p as u32);
             let annotated_m = m.and_then(|_| minus_iter.next());
             let annotated_p = p.and_then(|_| plus_iter.next());
             if let (Some(m), Some(p), Some(annotated_m), Some(annotated_p)) = (m, p, annotated_m, annotated_p) {
                 let (m, p) = (m as usize, p as usize);
-                let emph_m = emphasized(self.a.text.line(m), annotated_m, Op::Deletion);
-                let emph_p = emphasized(self.b.text.line(p), annotated_p, Op::Insertion);
-                paired.push((m, emph_m, p, emph_p));
+                let emph_m = emphasized(a_side.text.line(m), annotated_m, Op::Deletion);
+                let emph_p = emphasized(b_side.text.line(p), annotated_p, Op::Insertion);
+                pairs.push((m, emph_m, p, emph_p));
             }
-            result.push((m, p));
+            alignment.push((m, p));
         }
-        for (m, emph_m, p, emph_p) in paired {
-            self.a.kinds[m] = LineKind::Changed;
-            self.b.kinds[p] = LineKind::Changed;
-            self.a.set_spans(m, &emph_m);
-            self.b.set_spans(p, &emph_p);
+        Pairing { a, b, alignment, pairs }
+    }
+
+    /// Mark the lines of the hunk as removed from `a` and added to `b`, except those paired as
+    /// changed, with their changed parts.
+    pub(crate) fn apply(&self, a_side: &mut Side, b_side: &mut Side) {
+        self.apply_to(a_side, true, LineKind::Removed);
+        self.apply_to(b_side, false, LineKind::Added);
+    }
+
+    /// Mark one side's lines of the hunk: `unpaired` for those not paired, or else changed.
+    pub(crate) fn apply_to(&self, side: &mut Side, is_a: bool, unpaired: LineKind) {
+        let range = if is_a { self.a.clone() } else { self.b.clone() };
+        for i in range {
+            side.kinds[i as usize] = unpaired;
         }
-        result
+        self.apply_pairs_to(side, is_a);
+    }
+
+    /// Mark just one side's paired lines as changed, with their changed parts.
+    pub(crate) fn apply_pairs_to(&self, side: &mut Side, is_a: bool) {
+        for (m, emph_m, p, emph_p) in &self.pairs {
+            let (line, emph) = if is_a { (*m, emph_m) } else { (*p, emph_p) };
+            side.kinds[line] = LineKind::Changed;
+            side.set_spans(line, emph);
+        }
+    }
+
+    /// Rows for the hunk: delta gives unpaired lines rows of their own, but runs of them share
+    /// rows instead.
+    pub(crate) fn rows(&self) -> Vec<(Option<u32>, Option<u32>)> {
+        let mut rows = Vec::with_capacity(self.alignment.len());
+        let (mut minus, mut plus) = (Vec::new(), Vec::new());
+        let flush = |rows: &mut Vec<(Option<u32>, Option<u32>)>, minus: &mut Vec<u32>, plus: &mut Vec<u32>| {
+            for i in 0..minus.len().max(plus.len()) {
+                rows.push((minus.get(i).copied(), plus.get(i).copied()));
+            }
+            minus.clear();
+            plus.clear();
+        };
+        for &(m, p) in &self.alignment {
+            match (m, p) {
+                (Some(_), Some(_)) => {
+                    flush(&mut rows, &mut minus, &mut plus);
+                    rows.push((m, p));
+                }
+                (Some(m), None) => minus.push(m),
+                (None, Some(p)) => plus.push(p),
+                (None, None) => {}
+            }
+        }
+        flush(&mut rows, &mut minus, &mut plus);
+        rows
     }
 }
 

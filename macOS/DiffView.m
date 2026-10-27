@@ -25,12 +25,10 @@ static NSColor* dynamic_color(uint32_t light, uint32_t dark) {
 	}];
 }
 
-/* Indexed by DtLine.kind. */
-NSColor* g_line_colors[4];
-/* For the lines of the current hunk. */
-NSColor* g_current_line_colors[4];
-NSColor* g_emphasis_colors[4];
-NSColor* g_edge_colors[4];
+NSColor* g_line_colors[kKindCount];
+NSColor* g_current_line_colors[kKindCount];
+NSColor* g_emphasis_colors[kKindCount];
+NSColor* g_edge_colors[kKindCount];
 NSColor* g_filler_color;
 NSColor* g_middle_color;
 
@@ -47,6 +45,10 @@ static void init_colors(void) {
 	g_edge_colors[DT_LINE_CHANGED] = dynamic_color(0x9A8AE8, 0x7D6BD6);
 	g_edge_colors[DT_LINE_REMOVED] = dynamic_color(0xE08080, 0xB0545C);
 	g_edge_colors[DT_LINE_ADDED] = dynamic_color(0x7CC46A, 0x4F9A55);
+	g_line_colors[DT_LINE_CONFLICT] = dynamic_color(0xFFEBD6, 0x4A3320);
+	g_current_line_colors[DT_LINE_CONFLICT] = dynamic_color(0xFCDCBC, 0x5A3D22);
+	g_emphasis_colors[DT_LINE_CONFLICT] = dynamic_color(0xF7C08C, 0x7A5130);
+	g_edge_colors[DT_LINE_CONFLICT] = dynamic_color(0xF0A050, 0xC07830);
 	g_filler_color = dynamic_color(0xF4F4F6, 0x262628);
 	g_middle_color = dynamic_color(0xF7F7F9, 0x232325);
 }
@@ -56,11 +58,6 @@ NSColor* line_color(uint8_t kind, BOOL inCurrentHunk) {
 	return inCurrentHunk ? g_current_line_colors[kind] : g_line_colors[kind];
 }
 
-uint8_t hunk_kind(DtHunk hunk) {
-	if (hunk.a_start == hunk.a_end) return DT_LINE_ADDED;
-	if (hunk.b_start == hunk.b_end) return DT_LINE_REMOVED;
-	return DT_LINE_CHANGED;
-}
 
 static const NSTimeInterval kFlashDuration = 0.4;
 
@@ -160,11 +157,11 @@ typedef struct {
 		NSMutableArray* panes = [NSMutableArray array];
 		NSMutableArray* gutters = [NSMutableArray array];
 		NSMutableArray* connectors = [NSMutableArray array];
-		for (NSUInteger side = 0; side < kSideCount; side++) {
+		_sideCount = kSideCount;
+		/* Views for as many sides as a diff can have; those it doesn't are hidden. */
+		for (NSUInteger side = 0; side < kMaxSides; side++) {
 			DiffPaneView* pane = [[DiffPaneView alloc] initWithOwner:self side:side];
 			NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
-			/* One vertical scroller, at the far right, for all the sides. */
-			scroll.hasVerticalScroller = side + 1 == kSideCount;
 			scroll.hasHorizontalScroller = YES;
 			scroll.autohidesScrollers = YES;
 			scroll.backgroundColor = [NSColor textBackgroundColor];
@@ -182,7 +179,7 @@ typedef struct {
 			[scrolls addObject:scroll];
 			[panes addObject:pane];
 			[gutters addObject:gutter];
-			if (side + 1 < kSideCount) {
+			if (side + 1 < kMaxSides) {
 				DiffConnectorView* connector = [[DiffConnectorView alloc] initWithOwner:self side:side];
 				[self addSubview:connector];
 				[connectors addObject:connector];
@@ -192,9 +189,23 @@ typedef struct {
 		_panes = panes;
 		_gutters = gutters;
 		_connectors = connectors;
+		[self updateSideViews];
 		self.fontSize = 12;
 	}
 	return self;
+}
+
+/* Show the views of the sides there are: just side A's in Unified mode, which shows both. */
+- (void) updateSideViews {
+	NSUInteger shown = _mode == kDiffModeUnified ? 1 : _sideCount;
+	for (NSUInteger side = 0; side < kMaxSides; side++) {
+		_gutters[side].hidden = side >= shown;
+		_scrolls[side].hidden = side >= shown;
+		/* One vertical scroller, at the far right, for all the sides. */
+		_scrolls[side].hasVerticalScroller = side + 1 == shown;
+	}
+	for (NSUInteger side = 0; side < _connectors.count; side++) _connectors[side].hidden = side + 1 >= shown;
+	[self layoutSides];
 }
 
 - (void) dealloc {
@@ -223,15 +234,15 @@ typedef struct {
 		_scrolls[0].frame = NSMakeRect(gutter, 0, NSWidth(bounds) - gutter, NSHeight(bounds));
 		return;
 	}
-	CGFloat share = floor((NSWidth(bounds) - (CGFloat)(kSideCount - 1) * kMiddleWidth) / (CGFloat)kSideCount);
+	CGFloat share = floor((NSWidth(bounds) - (CGFloat)(_sideCount - 1) * kMiddleWidth) / (CGFloat)_sideCount);
 	CGFloat x = 0;
-	for (NSUInteger side = 0; side < kSideCount; side++) {
-		CGFloat width = side + 1 == kSideCount ? NSWidth(bounds) - x : share;
+	for (NSUInteger side = 0; side < _sideCount; side++) {
+		CGFloat width = side + 1 == _sideCount ? NSWidth(bounds) - x : share;
 		CGFloat gutter = fmin(_gutterWidth, width);
 		_gutters[side].frame = NSMakeRect(x, 0, gutter, NSHeight(bounds));
 		_scrolls[side].frame = NSMakeRect(x + gutter, 0, width - gutter, NSHeight(bounds));
 		x += width;
-		if (side < _connectors.count) {
+		if (side + 1 < _sideCount) {
 			_connectors[side].frame = NSMakeRect(x, 0, kMiddleWidth, NSHeight(bounds));
 			x += kMiddleWidth;
 		}
@@ -276,9 +287,11 @@ typedef struct {
 			}
 		}
 	}
+	_sideCount = diff ? dt_file_diff_side_count(diff) : kSideCount;
+	[self updateSideViews];
 	_maxLines = 0;
 	_maxColumns = 0;
-	for (NSUInteger side = 0; diff && side < kSideCount; side++) {
+	for (NSUInteger side = 0; diff && side < _sideCount; side++) {
 		size_t count = dt_file_diff_line_count(diff, (uint8_t)side);
 		if (count > _maxLines) _maxLines = count;
 		for (size_t i = 0; i < count; i++) {
@@ -351,7 +364,7 @@ typedef struct {
 /* The width to wrap lines to: that of the narrowest side showing, or 0 when not wrapping. */
 - (CGFloat) currentWrapWidth {
 	if (!_wrapsLines) return 0;
-	NSUInteger sides = _mode == kDiffModeUnified ? 1 : kSideCount;
+	NSUInteger sides = _mode == kDiffModeUnified ? 1 : _sideCount;
 	CGFloat width = CGFLOAT_MAX;
 	for (NSUInteger side = 0; side < sides; side++) width = fmin(width, _scrolls[side].contentSize.width);
 	/* At least a few characters, while the views are still being sized. */
@@ -482,8 +495,9 @@ static NSMutableData* new_tops(size_t count) {
 	size_t rows = _diff ? dt_file_diff_row_count(_diff) : 0;
 	size_t unifiedRows = _diff ? dt_file_diff_unified_count(_diff) : 0;
 
+	/* Laid out for every side views can show, those the diff hasn't empty. */
 	NSMutableArray<NSMutableData*>* lineTops = [NSMutableArray array];
-	for (NSUInteger side = 0; side < kSideCount; side++) {
+	for (NSUInteger side = 0; side < kMaxSides; side++) {
 		size_t count = _diff ? dt_file_diff_line_count(_diff, (uint8_t)side) : 0;
 		NSMutableData* tops = new_tops(count);
 		CGFloat* values = tops.mutableBytes;
@@ -496,7 +510,7 @@ static NSMutableData* new_tops(size_t count) {
 	CGFloat* rowValues = _rowTops.mutableBytes;
 	for (size_t row = 0; row < rows; row++) {
 		CGFloat height = 0;
-		for (NSUInteger side = 0; side < kSideCount; side++) {
+		for (NSUInteger side = 0; side < _sideCount; side++) {
 			int32_t line = dt_file_diff_row_line(_diff, row, (uint8_t)side);
 			if (line >= 0) height = fmax(height, [self lineY:(size_t)line + 1 side:side] - [self lineY:(size_t)line side:side]);
 		}
@@ -516,7 +530,7 @@ static NSMutableData* new_tops(size_t count) {
 	/* Anchors at the start of each row between hunks, and of each hunk, then at the end. */
 	NSMutableArray<NSMutableData*>* anchors = [NSMutableArray array];
 	size_t hunkCount = _diff ? dt_file_diff_hunk_count(_diff) : 0;
-	for (NSUInteger side = 0; side < kSideCount; side++) {
+	for (NSUInteger side = 0; side < kMaxSides; side++) {
 		NSMutableData* pairs = [NSMutableData data];
 		size_t hunkIndex = 0;
 		for (size_t row = 0; row < rows;) {
@@ -588,8 +602,8 @@ static NSMutableData* new_tops(size_t count) {
 }
 
 - (void) hunk:(DtHunk)hunk side:(NSUInteger)side start:(uint32_t*)start end:(uint32_t*)end {
-	*start = side == 0 ? hunk.a_start : hunk.b_start;
-	*end = side == 0 ? hunk.a_end : hunk.b_end;
+	*start = side < kMaxSides ? hunk.start[side] : 0;
+	*end = side < kMaxSides ? hunk.end[side] : 0;
 }
 
 /*
@@ -659,7 +673,7 @@ static NSMutableData* new_tops(size_t count) {
 		CGFloat top = [self rowY:hunk.row_start] - offset;
 		CGFloat bottom = [self rowY:hunk.row_end] - offset;
 		if (bottom < NSMinY(dirty) - 1 || top > NSMaxY(dirty) + 1) continue;
-		uint8_t kind = hunk_kind(hunk);
+		uint8_t kind = hunk.kind;
 		if (bands) {
 			[line_color(kind, (NSInteger)i == _currentHunk) setFill];
 			NSRectFill(NSMakeRect(NSMinX(dirty), top, NSWidth(dirty), bottom - top));
@@ -693,7 +707,7 @@ static NSMutableData* new_tops(size_t count) {
 		 */
 		uint32_t previousStart = 0, previousEnd = UINT32_MAX;
 		if (i > 0) [self hunk:dt_file_diff_hunk(_diff, i - 1) side:side start:&previousStart end:&previousEnd];
-		[g_edge_colors[hunk_kind(hunk)] setFill];
+		[g_edge_colors[hunk.kind] setFill];
 		if (previousEnd != start) NSRectFill(NSMakeRect(NSMinX(dirty), top, NSWidth(dirty), 1));
 		if (bottom - top >= 2) NSRectFill(NSMakeRect(NSMinX(dirty), bottom - 1, NSWidth(dirty), 1));
 	}
@@ -724,14 +738,7 @@ static NSMutableData* new_tops(size_t count) {
 - (void) setMode:(NSInteger)mode {
 	if (mode == _mode) return;
 	_mode = mode;
-	BOOL unified = mode == kDiffModeUnified;
-	for (NSUInteger side = 1; side < kSideCount; side++) {
-		_gutters[side].hidden = unified;
-		_scrolls[side].hidden = unified;
-	}
-	for (NSView* view in _connectors) view.hidden = unified;
-	_scrolls[0].hasVerticalScroller = unified || kSideCount == 1;
-	[self layoutSides];
+	[self updateSideViews];
 	/* Unified mode is wider, so lines wrap differently. */
 	[self layoutLines];
 	for (DiffPaneView* pane in _panes) [pane modeDidChange];

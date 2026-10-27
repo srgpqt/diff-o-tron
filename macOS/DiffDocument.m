@@ -1,6 +1,9 @@
 #import "DiffDocument.h"
 
+#import <objc/message.h>
+
 #import "DiffWindowController.h"
+#import "MergeEditor.h"
 #import "PathWatcher.h"
 
 #include "request.h"
@@ -60,6 +63,70 @@ static id path_url(NSURL* url) {
 	if (token) post_request_notification(kClosedNotification, token);
 }
 
+- (BOOL) saveMerge:(NSError**)error {
+	NSString* text = _isMerge && _mergedText ? _mergedText() : nil;
+	if (!text || !_outputURL) {
+		if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteUnknownError userInfo:nil];
+		return NO;
+	}
+	/* Not atomically, which would need to write to the output's folder, where the sandbox doesn't let the app. */
+	NSData* data = [text dataUsingEncoding:NSUTF8StringEncoding];
+	if (![data writeToURL:_outputURL options:0 error:error]) return NO;
+	[self updateChangeCount:NSChangeCleared];
+	if (_closeToken) {
+		BOOL resolved = !has_conflict_markers(text);
+		post_request_notification(resolved ? kMergedNotification : kUnresolvedNotification, _closeToken);
+	}
+	return YES;
+}
+
+- (IBAction) saveDocument:(id)sender {
+	NSError* error = nil;
+	if (![self saveMerge:&error] && error) [self presentError:error];
+}
+
+- (BOOL) validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
+	if (item.action == @selector(saveDocument:)) return _isMerge && _mergedText != nil;
+	return [super validateUserInterfaceItem:item];
+}
+
+/* A merge with unsaved changes asks whether to save them first. */
+- (void) canCloseDocumentWithDelegate:(id)delegate shouldCloseSelector:(SEL)selector contextInfo:(void*)contextInfo {
+	if (!_isMerge || !self.isDocumentEdited) {
+		[super canCloseDocumentWithDelegate:delegate shouldCloseSelector:selector contextInfo:contextInfo];
+		return;
+	}
+	void (^reply)(BOOL) = ^(BOOL shouldClose) {
+		if (selector) ((void (*)(id, SEL, NSDocument*, BOOL, void*))objc_msgSend)(delegate, selector, self, shouldClose, contextInfo);
+	};
+
+	NSAlert* alert = [[NSAlert alloc] init];
+	alert.messageText = [NSString stringWithFormat:@"Do you want to save the merge of “%@”?", self.displayName];
+	alert.informativeText = @"Your changes will be lost if you don't save them.";
+	[alert addButtonWithTitle:@"Save"];
+	[alert addButtonWithTitle:@"Cancel"];
+	NSButton* dontSave = [alert addButtonWithTitle:@"Don't Save"];
+	dontSave.keyEquivalent = @"d";
+	dontSave.keyEquivalentModifierMask = NSEventModifierFlagCommand;
+
+	void (^handler)(NSModalResponse) = ^(NSModalResponse response) {
+		if (response == NSAlertFirstButtonReturn) {
+			NSError* error = nil;
+			BOOL saved = [self saveMerge:&error];
+			if (!saved) [self presentError:error];
+			reply(saved);
+		} else {
+			reply(response == NSAlertThirdButtonReturn);
+		}
+	};
+	NSWindow* window = self.windowControllers.firstObject.window;
+	if (window) {
+		[alert beginSheetModalForWindow:window completionHandler:handler];
+	} else {
+		handler([alert runModal]);
+	}
+}
+
 - (NSString*) displayName {
 	NSString* a = [self urlForSide:0] ? [self nameForSide:0] : nil;
 	NSString* b = [self urlForSide:1] ? [self nameForSide:1] : nil;
@@ -104,6 +171,16 @@ static id path_url(NSURL* url) {
 	[self setURLs:urls labels:nil];
 }
 
+- (void) setMergeBase:(NSURL*)base a:(NSURL*)a b:(NSURL*)b output:(NSURL*)output labels:(NSArray<NSString*>*)labels {
+	_isMerge = YES;
+	_baseURL = base.filePathURL;
+	_outputURL = output.filePathURL;
+	NSString* label = labels.count > 0 ? labels[0] : nil;
+	_baseLabel = [label isKindOfClass:[NSString class]] && label.length > 0 ? label : nil;
+	NSArray* sideLabels = labels.count >= 3 ? @[labels[1], labels[2]] : nil;
+	[self setURLs:@[a, b] labels:sideLabels];
+}
+
 - (void) setURLs:(NSArray<NSURL*>*)urls labels:(NSArray<NSString*>*)labels {
 	for (NSUInteger side = 0; side < kSideCount && side < urls.count; side++) {
 		_urls[side] = path_url(urls[side]);
@@ -132,6 +209,9 @@ static id path_url(NSURL* url) {
 
 - (void) watchSides {
 	for (PathWatcher* watcher in _watchers) [watcher stop];
+	_watchers = nil;
+	/* A merge isn't reloaded, which would lose the merged result's edits. */
+	if (_isMerge) return;
 	NSMutableArray<PathWatcher*>* watchers = [NSMutableArray array];
 	__weak DiffDocument* weakSelf = self;
 	for (NSUInteger side = 0; side < kSideCount; side++) {

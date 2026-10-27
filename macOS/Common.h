@@ -6,8 +6,10 @@
 
 #include "diffotron.h"
 
-/* The number of compared sides; a merge will add a base and a result. */
+/* The number of compared sides. */
 static const NSUInteger kSideCount = 2;
+/* The most sides a diff has: a merge's base, A and B. */
+static const NSUInteger kMaxSides = DT_MAX_SIDES;
 static const uint32_t kTabWidth = 4;
 
 NSString* dt_string(DtStr s);

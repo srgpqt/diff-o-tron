@@ -91,7 +91,7 @@
 
 	DiffView* owner = _owner;
 	DtLine line = dt_file_diff_line(owner.diff, (uint8_t)side, (size_t)lineIndex);
-	if (line.kind != DT_LINE_EQUAL && line.kind < 4) {
+	if (line.kind != DT_LINE_EQUAL && line.kind < kKindCount) {
 		[line_color(line.kind, inCurrentHunk) setFill];
 		NSRectFill(frame);
 	}

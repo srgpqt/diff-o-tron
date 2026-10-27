@@ -213,7 +213,7 @@ static BOOL position_equal(TextPosition a, TextPosition b) {
 
 	DiffView* owner = _owner;
 	DtLine line = dt_file_diff_line(owner.diff, (uint8_t)side, (size_t)lineIndex);
-	BOOL changed = line.kind != DT_LINE_EQUAL && line.kind < 4;
+	BOOL changed = line.kind != DT_LINE_EQUAL && line.kind < kKindCount;
 	if (changed) {
 		[line_color(line.kind, inCurrentHunk) setFill];
 		NSRectFill(frame);

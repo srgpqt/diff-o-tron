@@ -102,8 +102,14 @@
 	NSArray* labels = request[kRequestLabels];
 	if (![labels isKindOfClass:[NSArray class]]) labels = nil;
 	BOOL wait = [request[kRequestWait] boolValue];
+	NSString* output = request[kRequestOutput];
 
-	DiffDocument* doc = urls.count == kSideCount ? [self openComparisonWithURLs:urls labels:labels] : nil;
+	DiffDocument* doc = nil;
+	if ([output isKindOfClass:[NSString class]]) {
+		if (urls.count == 3) doc = [self openMergeWithURLs:urls output:[NSURL fileURLWithPath:output] labels:labels];
+	} else if (urls.count == kSideCount) {
+		doc = [self openComparisonWithURLs:urls labels:labels];
+	}
 	if (doc && wait) doc.closeToken = token;
 	post_request_notification(kOpenedNotification, token);
 	if (!doc && wait) post_request_notification(kClosedNotification, token);
@@ -112,20 +118,27 @@
 /* Compare the URLs in the frontmost window if it's empty, or else in a new one. */
 - (DiffDocument*) openComparisonWithURLs:(NSArray<NSURL*>*)urls labels:(NSArray<NSString*>*)labels {
 	if (urls.count == 0) return nil;
-	DiffDocument* doc = nil;
-	NSDocument* current = self.currentDocument;
-	if ([current isKindOfClass:[DiffDocument class]] && [(DiffDocument*)current isEmpty]) {
-		doc = (DiffDocument*)current;
-	} else {
-		NSError* error = nil;
-		doc = [self openUntitledDocumentAndDisplay:YES error:&error];
-		if (!doc) {
-			if (error) [self presentError:error];
-			return nil;
-		}
-	}
+	DiffDocument* doc = [self emptyDocument];
 	[doc setURLs:urls labels:labels];
 	[doc showWindows];
+	return doc;
+}
+
+/* Merge A and B (urls[1] and urls[2]) against their base (urls[0]), in the frontmost window if it's empty, or else in a new one. */
+- (DiffDocument*) openMergeWithURLs:(NSArray<NSURL*>*)urls output:(NSURL*)output labels:(NSArray<NSString*>*)labels {
+	DiffDocument* doc = [self emptyDocument];
+	[doc setMergeBase:urls[0] a:urls[1] b:urls[2] output:output labels:labels];
+	[doc showWindows];
+	return doc;
+}
+
+/* The frontmost window's document if it's empty, or else a new one. */
+- (DiffDocument*) emptyDocument {
+	NSDocument* current = self.currentDocument;
+	if ([current isKindOfClass:[DiffDocument class]] && [(DiffDocument*)current isEmpty]) return (DiffDocument*)current;
+	NSError* error = nil;
+	DiffDocument* doc = [self openUntitledDocumentAndDisplay:YES error:&error];
+	if (!doc && error) [self presentError:error];
 	return doc;
 }
 

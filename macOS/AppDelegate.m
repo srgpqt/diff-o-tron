@@ -30,8 +30,12 @@ static void build_main_menu(NSApplication* app) {
 
 	NSString* up = key_string(NSUpArrowFunctionKey);
 	NSString* down = key_string(NSDownArrowFunctionKey);
+	NSString* left = key_string(NSLeftArrowFunctionKey);
+	NSString* right = key_string(NSRightArrowFunctionKey);
+	NSString* backspace = key_string(NSBackspaceCharacter);
 	NSEventModifierFlags command = NSEventModifierFlagCommand;
 	NSEventModifierFlags shiftCommand = NSEventModifierFlagShift | NSEventModifierFlagCommand;
+	NSEventModifierFlags optionCommand = NSEventModifierFlagOption | NSEventModifierFlagCommand;
 
 	/* App menu */ {
 		NSMenu* appMenu = add_menu(mainMenu, @"Diff-o-tron");
@@ -51,6 +55,7 @@ static void build_main_menu(NSApplication* app) {
 		[fileMenu addItem:_(@"Open…", @selector(openDocument:), @"o")];
 		[fileMenu addItem:[NSMenuItem separatorItem]];
 		[fileMenu addItem:_(@"Close", @selector(performClose:), @"w")];
+		[fileMenu addItem:_(@"Save", @selector(saveDocument:), @"s")];
 	}
 
 	/* Edit menu */ {
@@ -61,8 +66,32 @@ static void build_main_menu(NSApplication* app) {
 		[editMenu addItem:_(@"Cut", @selector(cut:), @"x")];
 		[editMenu addItem:_(@"Copy", @selector(copy:), @"c")];
 		[editMenu addItem:_(@"Paste", @selector(paste:), @"v")];
+		[editMenu addItem:with_modifiers(_(@"Paste and Match Style", @selector(pasteAsPlainText:), @"v"), optionCommand | NSEventModifierFlagShift)];
 		[editMenu addItem:_(@"Delete", @selector(delete:), @"")];
 		[editMenu addItem:_(@"Select All", @selector(selectAll:), @"a")];
+		[editMenu addItem:[NSMenuItem separatorItem]];
+
+		/* For the merged result. */
+		NSMenuItem* findItem = _(@"Find", NULL, @"");
+		NSMenu* findMenu = [[NSMenu alloc] initWithTitle:@"Find"];
+		findItem.submenu = findMenu;
+		[editMenu addItem:findItem];
+		NSMenuItem* find = _(@"Find…", @selector(performTextFinderAction:), @"f");
+		find.tag = NSTextFinderActionShowFindInterface;
+		[findMenu addItem:find];
+		NSMenuItem* replace = with_modifiers(_(@"Find and Replace…", @selector(performTextFinderAction:), @"f"), optionCommand);
+		replace.tag = NSTextFinderActionShowReplaceInterface;
+		[findMenu addItem:replace];
+		NSMenuItem* findNext = _(@"Find Next", @selector(performTextFinderAction:), @"g");
+		findNext.tag = NSTextFinderActionNextMatch;
+		[findMenu addItem:findNext];
+		NSMenuItem* findPrevious = _(@"Find Previous", @selector(performTextFinderAction:), @"G");
+		findPrevious.tag = NSTextFinderActionPreviousMatch;
+		[findMenu addItem:findPrevious];
+		NSMenuItem* useSelection = _(@"Use Selection for Find", @selector(performTextFinderAction:), @"e");
+		useSelection.tag = NSTextFinderActionSetSearchString;
+		[findMenu addItem:useSelection];
+		[findMenu addItem:_(@"Jump to Selection", @selector(centerSelectionInVisibleArea:), @"j")];
 	}
 
 	/* View menu */ {
@@ -85,6 +114,16 @@ static void build_main_menu(NSApplication* app) {
 		[viewMenu addItem:[NSMenuItem separatorItem]];
 		[viewMenu addItem:with_modifiers(_(@"Wrap Lines", @selector(toggleWrapLines:), @"k"), shiftCommand)];
 		[viewMenu addItem:with_modifiers(_(@"Ignore Whitespace", @selector(toggleIgnoreWhitespace:), @"'"), shiftCommand)];
+	}
+
+	/* Merge menu: replacing the current change in the merged result. */ {
+		NSMenu* mergeMenu = add_menu(mainMenu, @"Merge");
+		[mergeMenu addItem:with_modifiers(_(@"Take A", @selector(takeA:), left), command)];
+		[mergeMenu addItem:with_modifiers(_(@"Take B", @selector(takeB:), right), command)];
+		[mergeMenu addItem:with_modifiers(_(@"Take A then B", @selector(takeAThenB:), right), optionCommand)];
+		[mergeMenu addItem:with_modifiers(_(@"Take B then A", @selector(takeBThenA:), left), optionCommand)];
+		[mergeMenu addItem:[NSMenuItem separatorItem]];
+		[mergeMenu addItem:with_modifiers(_(@"Reset Change", @selector(resetChange:), backspace), optionCommand)];
 	}
 
 	/* Window menu */ {

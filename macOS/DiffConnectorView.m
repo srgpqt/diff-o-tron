@@ -51,7 +51,7 @@
 		CGFloat nextBottom = [owner lineY:nextEnd side:next] - nextOffset;
 		if (fmax(bottom, nextBottom) < NSMinY(dirty) - 1 || fmin(top, nextTop) > NSMaxY(dirty) + 1) continue;
 
-		uint8_t kind = hunk_kind(hunk);
+		uint8_t kind = hunk.kind;
 		NSBezierPath* band = [NSBezierPath bezierPath];
 		[band moveToPoint:NSMakePoint(0, top)];
 		[band lineToPoint:NSMakePoint(width, nextTop)];

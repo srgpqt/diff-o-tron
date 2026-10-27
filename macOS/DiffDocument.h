@@ -3,7 +3,7 @@
 /* The document type of comparisons. */
 static NSString* const kComparisonType = @"Comparison";
 
-/* A comparison of the files or folders at its URLs. Never saved. */
+/* A comparison of the files or folders at its URLs, never saved; or a merge of two files, saved to a third. */
 @interface DiffDocument : NSDocument
 	@property (nonatomic, readonly) DtComparison* comparison;
 	@property (nonatomic, readonly) BOOL comparing;
@@ -24,4 +24,20 @@ static NSString* const kComparisonType = @"Comparison";
 	/* Sets the sides and their labels (empty strings for none) from the first of each. */
 	- (void) setURLs:(NSArray<NSURL*>*)urls labels:(NSArray<NSString*>*)labels;
 	- (BOOL) isEmpty;
+
+	/*
+	 * A merge of A and B, the document's sides, against their base, saved to the
+	 * output file. Its window shows the base, A and B, and the merged result.
+	 */
+	@property (nonatomic, readonly) BOOL isMerge;
+	@property (nonatomic, readonly) NSURL* baseURL;
+	/* The base's label, or nil for none. */
+	@property (nonatomic, readonly) NSString* baseLabel;
+	@property (nonatomic, readonly) NSURL* outputURL;
+	/* labels: the base's, A's and B's, empty strings for none. */
+	- (void) setMergeBase:(NSURL*)base a:(NSURL*)a b:(NSURL*)b output:(NSURL*)output labels:(NSArray<NSString*>*)labels;
+	/* The merged result to save, from the window that edits it; nil while there's none. */
+	@property (nonatomic, copy) NSString* (^mergedText)(void);
+	/* Write the merged result to the output file, and tell the diffotron command whether it has conflicts left. */
+	- (BOOL) saveMerge:(NSError**)error;
 @end

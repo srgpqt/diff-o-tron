@@ -10,7 +10,8 @@
 
 /*
  * The diffotron command, installed in Diff-o-tron.app/Contents/Helpers: opens
- * two files or folders in Diff-o-tron, as `git difftool` does.
+ * two files or folders in Diff-o-tron, as `git difftool` does, or a merge, as
+ * `git mergetool` does.
  */
 
 static NSString* const kBundleIdentifier = @"com.srgpqt.diff-o-tron";
@@ -20,27 +21,40 @@ static const int64_t kOpenTimeout = 60;
 
 static const char* const kUsage =
 	"usage: diffotron [-w | --wait] [-v | --verbose] [-L | --label LABEL]... PATH_A PATH_B\n"
+	"       diffotron -o | --output MERGED [-v | --verbose] [-L | --label LABEL]... BASE FILE_A FILE_B\n"
 	"\n"
-	"Compare two files or folders in Diff-o-tron.\n"
+	"Compare two files or folders in Diff-o-tron, or merge the changes two files\n"
+	"made to their base.\n"
 	"\n"
-	"  -w, --wait         wait until the comparison is closed\n"
-	"  -v, --verbose      describe what's happening\n"
-	"  -L, --label LABEL  show LABEL instead of a path's name: given once for both\n"
-	"                     sides, or twice for A then B\n"
+	"  -w, --wait           wait until the comparison is closed\n"
+	"  -o, --output MERGED  merge FILE_A's and FILE_B's changes to BASE, to save to\n"
+	"                       MERGED; wait until the merge is closed, and exit with 1\n"
+	"                       unless it was last saved with no conflicts left\n"
+	"  -v, --verbose        describe what's happening\n"
+	"  -L, --label LABEL    show LABEL instead of a path's name: given once for every\n"
+	"                       side, or else for each side in turn\n"
 	"\n"
-	"To use it with git difftool, add this to ~/.gitconfig:\n"
+	"To use it with git difftool and git mergetool, add this to ~/.gitconfig:\n"
 	"\n"
 	"  [diff]\n"
 	"      tool = diffotron\n"
 	"  [difftool]\n"
 	"      prompt = false\n"
 	"  [difftool \"diffotron\"]\n"
-	"      cmd = diffotron --wait --label \\\"$MERGED\\\" \\\"$LOCAL\\\" \\\"$REMOTE\\\"\n";
+	"      cmd = diffotron --wait --label \\\"$MERGED\\\" \\\"$LOCAL\\\" \\\"$REMOTE\\\"\n"
+	"  [merge]\n"
+	"      tool = diffotron\n"
+	"  [mergetool \"diffotron\"]\n"
+	"      cmd = diffotron --label \\\"$MERGED\\\" --output \\\"$MERGED\\\" \\\"$BASE\\\" \\\"$LOCAL\\\" \\\"$REMOTE\\\"\n"
+	"      trustExitCode = true\n";
 
 static NSURL* g_request_dir = nil;
 static NSMutableArray* g_sources = nil;
 static BOOL g_opened = NO;
 static BOOL g_verbose = NO;
+/* Merging, and whether the merge was last saved with no conflicts left. */
+static BOOL g_merging = NO;
+static BOOL g_merged = NO;
 
 static void note(NSString* message) {
 	if (g_verbose) fprintf(stderr, "diffotron: %s\n", message.UTF8String);
@@ -54,6 +68,15 @@ static void finish(int status) {
 static void fail(NSString* message) {
 	fprintf(stderr, "diffotron: %s\n", message.UTF8String);
 	finish(1);
+}
+
+/* Done with the comparison, or with the merge, as it was left. */
+static void finish_closed(void) {
+	if (g_merging && !g_merged) {
+		fprintf(stderr, "diffotron: The merge wasn't saved without conflicts\n");
+		finish(1);
+	}
+	finish(0);
 }
 
 static NSString* arg_string(const char* arg) {
@@ -105,7 +128,7 @@ static void watch_process(pid_t pid) {
 	dispatch_source_set_event_handler(source, ^(void) {
 		note(@"Diff-o-tron quit");
 		if (!g_opened) fail(@"Diff-o-tron quit before opening the comparison");
-		finish(0);
+		finish_closed();
 	});
 	dispatch_resume(source);
 	[g_sources addObject:source];
@@ -127,6 +150,7 @@ int main(int argc, const char* argv[]) {
 	@autoreleasepool {
 		g_sources = [NSMutableArray array];
 		BOOL wait = NO;
+		NSString* output = nil;
 		NSMutableArray<NSString*>* labels = [NSMutableArray array];
 		NSMutableArray<NSString*>* paths = [NSMutableArray array];
 
@@ -145,6 +169,12 @@ int main(int argc, const char* argv[]) {
 					return 2;
 				}
 				[labels addObject:arg_string(argv[i])];
+			} else if (options && ([arg isEqualToString:@"-o"] || [arg isEqualToString:@"--output"])) {
+				if (++i >= argc || output) {
+					fputs(kUsage, stderr);
+					return 2;
+				}
+				output = arg_string(argv[i]);
 			} else if (options && ([arg isEqualToString:@"-h"] || [arg isEqualToString:@"--help"])) {
 				fputs(kUsage, stdout);
 				return 0;
@@ -155,12 +185,16 @@ int main(int argc, const char* argv[]) {
 				[paths addObject:arg];
 			}
 		}
-		if (paths.count != 2 || labels.count > 2) {
+		/* A merge's sides are its base, A and B. */
+		g_merging = output != nil;
+		NSUInteger sides = g_merging ? 3 : 2;
+		if (paths.count != sides || labels.count > sides) {
 			fputs(kUsage, stderr);
 			return 2;
 		}
-		if (labels.count == 1) [labels addObject:labels[0]];
-		while (labels.count < 2) [labels addObject:@""];
+		if (g_merging) wait = YES;
+		NSString* fill = labels.count == 1 ? labels[0] : @"";
+		while (labels.count < sides) [labels addObject:fill];
 
 		/* git difftool passes paths relative to the top of the working tree, where it runs. */
 		NSMutableArray<NSURL*>* urls = [NSMutableArray array];
@@ -182,6 +216,20 @@ int main(int argc, const char* argv[]) {
 			if (isFile.boolValue && ![resolved isEqual:url]) [urls addObject:resolved];
 		}
 
+		/* The file the merge is saved to, which the sandboxed app can write to but not create. */
+		NSString* outputPath = nil;
+		if (output) {
+			NSURL* url = [NSURL fileURLWithPath:output].URLByStandardizingPath;
+			NSError* writeError = nil;
+			if (![[NSFileManager defaultManager] fileExistsAtPath:url.path] && ![[NSData data] writeToURL:url options:0 error:&writeError]) {
+				fail([NSString stringWithFormat:@"%@: %@", output, writeError.localizedDescription]);
+			}
+			outputPath = url.path;
+			[urls addObject:url];
+			NSURL* resolved = url.URLByResolvingSymlinksInPath;
+			if (![resolved isEqual:url]) [urls addObject:resolved];
+		}
+
 		NSURL* app = app_url();
 		if (!app) fail(@"Diff-o-tron isn't installed");
 
@@ -192,12 +240,13 @@ int main(int argc, const char* argv[]) {
 		free(dir);
 
 		NSString* token = [NSUUID UUID].UUIDString;
-		NSDictionary* request = @{
+		NSMutableDictionary* request = [@{
 			kRequestPaths: absolutePaths,
 			kRequestLabels: labels,
 			kRequestToken: token,
 			kRequestWait: @(wait)
-		};
+		} mutableCopy];
+		if (outputPath) request[kRequestOutput] = outputPath;
 		NSURL* requestURL = [g_request_dir URLByAppendingPathComponent:[@"comparison" stringByAppendingPathExtension:kRequestExtension]];
 		NSError* error = nil;
 		if (![request writeToURL:requestURL error:&error]) fail(error.localizedDescription);
@@ -215,7 +264,15 @@ int main(int argc, const char* argv[]) {
 		}];
 		[center addObserverForName:kClosedNotification object:token queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* notification) {
 			note(@"Diff-o-tron closed the comparison");
-			finish(0);
+			finish_closed();
+		}];
+		[center addObserverForName:kMergedNotification object:token queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* notification) {
+			note(@"Diff-o-tron saved the merge with no conflicts left");
+			g_merged = YES;
+		}];
+		[center addObserverForName:kUnresolvedNotification object:token queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification* notification) {
+			note(@"Diff-o-tron saved the merge with conflicts left");
+			g_merged = NO;
 		}];
 
 		note([NSString stringWithFormat:@"Opening %@ with %@", [urls valueForKey:@"path"], app.path]);

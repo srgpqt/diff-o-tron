@@ -5,6 +5,7 @@
 #import "DiffView.h"
 #import "DropHighlightView.h"
 #import "DropView.h"
+#import "MergeEditor.h"
 #import "SidebarItem.h"
 
 /* User defaults: the DiffView mode new windows start in, and whether they wrap lines. */
@@ -24,6 +25,10 @@ static const NSLayoutPriority kSqueezablePriority = NSLayoutPriorityDefaultLow;
 
 static const CGFloat kHeaderHeight = 36;
 static const CGFloat kBottomBarHeight = 32;
+/* The merged result's title bar, and the least height of it and of the diff above it. */
+static const CGFloat kMergeHeaderHeight = 28;
+static const CGFloat kMinMergeHeight = 100;
+static const CGFloat kMinDiffHeight = 120;
 
 static NSString* status_symbol(uint8_t status) {
 	switch (status) {
@@ -43,6 +48,22 @@ static NSString* status_name(uint8_t status) {
 	}
 }
 
+/* A pane's title: its letter, and the name of its file. */
+static NSAttributedString* pane_title(NSString* letter, NSString* name) {
+	NSDictionary* letterAttributes = @{
+		NSFontAttributeName: [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],
+		NSForegroundColorAttributeName: [NSColor secondaryLabelColor]
+	};
+	NSDictionary* nameAttributes = @{
+		NSFontAttributeName: [NSFont systemFontOfSize:13],
+		NSForegroundColorAttributeName: [NSColor labelColor]
+	};
+	NSMutableAttributedString* title = [[NSMutableAttributedString alloc] initWithString:letter attributes:letterAttributes];
+	NSString* spacedName = [@"   " stringByAppendingString:name];
+	[title appendAttributedString:[[NSAttributedString alloc] initWithString:spacedName attributes:nameAttributes]];
+	return title;
+}
+
 static NSColor* status_color(uint8_t status) {
 	switch (status) {
 		case DT_STATUS_MODIFIED: return [NSColor systemPurpleColor];
@@ -58,7 +79,23 @@ static NSColor* status_color(uint8_t status) {
 	NSTextField* _sidebarTitle;
 	NSProgressIndicator* _spinner;
 	NSArray<NSTextField*>* _paneTitles;
+	/* Placing the pane titles over the sides there are. */
+	NSArray<NSLayoutConstraint*>* _paneTitleConstraints;
+	NSUInteger _paneTitleCount;
 	DiffView* _diffView;
+	/* The diff above, and the merged result below, for a merge. */
+	NSSplitView* _mergeSplit;
+	NSView* _mergePane;
+	NSTextField* _mergeTitle;
+	NSTextView* _mergeText;
+	/* The root of _mergeText's text system, which owns the rest of it, but which nothing else owns. */
+	NSTextStorage* _mergeStorage;
+	MergeEditor* _mergeEditor;
+	BOOL _showsMerge;
+	/* The comparison generation whose merge the merged result was loaded from. */
+	NSUInteger _mergeGeneration;
+	/* Set while changing the merged result's selection, so as not to take that as choosing a change. */
+	BOOL _selectingMerge;
 	NSTextField* _message;
 	NSTextField* _changeLabel;
 	NSButton* _previousButton;
@@ -85,6 +122,7 @@ static NSColor* status_color(uint8_t status) {
 	if ((self = [super initWithWindow:window])) {
 		_items = [NSMutableArray array];
 		_shownGeneration = NSUIntegerMax;
+		_mergeGeneration = NSUIntegerMax;
 		_shownEntry = -1;
 		window.delegate = self;
 		window.restorable = NO;
@@ -145,7 +183,7 @@ static NSColor* status_color(uint8_t status) {
 	[detail registerForDraggedTypes:@[NSPasteboardTypeFileURL]];
 
 	NSMutableArray<NSTextField*>* titles = [NSMutableArray array];
-	for (NSUInteger side = 0; side < kSideCount; side++) {
+	for (NSUInteger side = 0; side < kMaxSides; side++) {
 		NSTextField* title = [NSTextField labelWithString:@""];
 		title.lineBreakMode = NSLineBreakByTruncatingMiddle;
 		/* Truncate a long name rather than push the sidebar narrower. */
@@ -162,7 +200,7 @@ static NSColor* status_color(uint8_t status) {
 	_diffView = [[DiffView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)];
 	__weak DiffWindowController* weakSelf = self;
 	_diffView.currentHunkChanged = ^(void) {
-		[weakSelf updateChangeLabel];
+		[weakSelf currentHunkDidChange];
 	};
 	NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
 	NSInteger mode = [defaults objectForKey:kDiffModeDefault] ? [defaults integerForKey:kDiffModeDefault] : kDiffModeFluid;
@@ -204,28 +242,32 @@ static NSColor* status_color(uint8_t status) {
 	_highlight = [[DropHighlightView alloc] initWithFrame:NSZeroRect];
 	detail.highlightView = _highlight;
 
-	add_subviews(detail, @[titles[0], titles[1], topSeparator, _diffView, _message, bottomSeparator, bar, _highlight]);
-	[NSLayoutConstraint activateConstraints:@[
-		/* Each title over its side, as DiffView lays them out. */
-		[titles[0].leadingAnchor constraintEqualToAnchor:detail.leadingAnchor constant:12],
-		[titles[0].trailingAnchor constraintLessThanOrEqualToAnchor:detail.centerXAnchor constant:-kMiddleWidth / 2 - 8],
-		[titles[0].centerYAnchor constraintEqualToAnchor:detail.topAnchor constant:kHeaderHeight / 2],
-		[titles[1].leadingAnchor constraintEqualToAnchor:detail.centerXAnchor constant:kMiddleWidth / 2 + 12],
-		[titles[1].trailingAnchor constraintLessThanOrEqualToAnchor:detail.trailingAnchor constant:-12],
-		[titles[1].centerYAnchor constraintEqualToAnchor:titles[0].centerYAnchor],
+	_mergeSplit = [[NSSplitView alloc] init];
+	_mergeSplit.vertical = NO;
+	_mergeSplit.dividerStyle = NSSplitViewDividerStyleThin;
+	_mergeSplit.delegate = self;
+	[_mergeSplit addSubview:_diffView];
+	[_mergeSplit addSubview:[self buildMergePane]];
 
+	add_subviews(detail, titles);
+	add_subviews(detail, @[topSeparator, _mergeSplit, _message, bottomSeparator, bar, _highlight]);
+	for (NSTextField* title in titles) {
+		[title.centerYAnchor constraintEqualToAnchor:detail.topAnchor constant:kHeaderHeight / 2].active = YES;
+	}
+	[self layoutPaneTitles:kSideCount];
+	[NSLayoutConstraint activateConstraints:@[
 		[topSeparator.topAnchor constraintEqualToAnchor:detail.topAnchor constant:kHeaderHeight],
 		[topSeparator.leadingAnchor constraintEqualToAnchor:detail.leadingAnchor],
 		[topSeparator.trailingAnchor constraintEqualToAnchor:detail.trailingAnchor],
 		[topSeparator.heightAnchor constraintEqualToConstant:1],
 
-		[_diffView.topAnchor constraintEqualToAnchor:topSeparator.bottomAnchor],
-		[_diffView.leadingAnchor constraintEqualToAnchor:detail.leadingAnchor],
-		[_diffView.trailingAnchor constraintEqualToAnchor:detail.trailingAnchor],
-		[_diffView.bottomAnchor constraintEqualToAnchor:bottomSeparator.topAnchor],
+		[_mergeSplit.topAnchor constraintEqualToAnchor:topSeparator.bottomAnchor],
+		[_mergeSplit.leadingAnchor constraintEqualToAnchor:detail.leadingAnchor],
+		[_mergeSplit.trailingAnchor constraintEqualToAnchor:detail.trailingAnchor],
+		[_mergeSplit.bottomAnchor constraintEqualToAnchor:bottomSeparator.topAnchor],
 
-		[_message.centerXAnchor constraintEqualToAnchor:_diffView.centerXAnchor],
-		[_message.centerYAnchor constraintEqualToAnchor:_diffView.centerYAnchor],
+		[_message.centerXAnchor constraintEqualToAnchor:_mergeSplit.centerXAnchor],
+		[_message.centerYAnchor constraintEqualToAnchor:_mergeSplit.centerYAnchor],
 		[_message.widthAnchor constraintLessThanOrEqualToConstant:420],
 
 		[bottomSeparator.leadingAnchor constraintEqualToAnchor:detail.leadingAnchor],
@@ -244,6 +286,107 @@ static NSColor* status_color(uint8_t status) {
 		[_highlight.bottomAnchor constraintEqualToAnchor:detail.bottomAnchor]
 	]];
 	return detail;
+}
+
+/* The merged result: a title, and the text to edit. Hidden but for a merge. */
+- (NSView*) buildMergePane {
+	_mergeTitle = [NSTextField labelWithString:@""];
+	_mergeTitle.lineBreakMode = NSLineBreakByTruncatingMiddle;
+	[_mergeTitle setContentCompressionResistancePriority:kSqueezablePriority forOrientation:NSLayoutConstraintOrientationHorizontal];
+	NSBox* separator = [[NSBox alloc] init];
+	separator.boxType = NSBoxSeparator;
+
+	/* With TextKit 1's layout manager, which colors the changes. */
+	_mergeStorage = [[NSTextStorage alloc] init];
+	NSLayoutManager* layoutManager = [[NSLayoutManager alloc] init];
+	[_mergeStorage addLayoutManager:layoutManager];
+	NSTextContainer* container = [[NSTextContainer alloc] initWithSize:NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX)];
+	[layoutManager addTextContainer:container];
+	_mergeText = [[NSTextView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100) textContainer:container];
+	_mergeText.minSize = NSMakeSize(0, 0);
+	_mergeText.verticallyResizable = YES;
+	_mergeText.autoresizingMask = NSViewWidthSizable;
+	NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)];
+	scroll.hasVerticalScroller = YES;
+	scroll.autohidesScrollers = YES;
+	scroll.documentView = _mergeText;
+	_mergeText.richText = NO;
+	_mergeText.importsGraphics = NO;
+	_mergeText.allowsUndo = YES;
+	_mergeText.usesFindBar = YES;
+	_mergeText.incrementalSearchingEnabled = YES;
+	_mergeText.smartInsertDeleteEnabled = NO;
+	_mergeText.automaticQuoteSubstitutionEnabled = NO;
+	_mergeText.automaticDashSubstitutionEnabled = NO;
+	_mergeText.automaticTextReplacementEnabled = NO;
+	_mergeText.automaticSpellingCorrectionEnabled = NO;
+	_mergeText.automaticLinkDetectionEnabled = NO;
+	_mergeText.automaticDataDetectionEnabled = NO;
+	_mergeText.continuousSpellCheckingEnabled = NO;
+	_mergeText.grammarCheckingEnabled = NO;
+	_mergeText.textContainerInset = NSMakeSize(4, 4);
+	_mergeText.delegate = self;
+	_mergeEditor = [[MergeEditor alloc] initWithTextView:_mergeText];
+	[self updateMergeFont];
+	[self updateMergeWrapping];
+
+	_mergePane = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 100, 100)];
+	_mergePane.hidden = YES;
+	add_subviews(_mergePane, @[_mergeTitle, separator, scroll]);
+	[NSLayoutConstraint activateConstraints:@[
+		[_mergeTitle.leadingAnchor constraintEqualToAnchor:_mergePane.leadingAnchor constant:12],
+		[_mergeTitle.trailingAnchor constraintLessThanOrEqualToAnchor:_mergePane.trailingAnchor constant:-12],
+		[_mergeTitle.centerYAnchor constraintEqualToAnchor:_mergePane.topAnchor constant:kMergeHeaderHeight / 2],
+		[separator.topAnchor constraintEqualToAnchor:_mergePane.topAnchor constant:kMergeHeaderHeight],
+		[separator.leadingAnchor constraintEqualToAnchor:_mergePane.leadingAnchor],
+		[separator.trailingAnchor constraintEqualToAnchor:_mergePane.trailingAnchor],
+		[separator.heightAnchor constraintEqualToConstant:1],
+		[scroll.topAnchor constraintEqualToAnchor:separator.bottomAnchor],
+		[scroll.leadingAnchor constraintEqualToAnchor:_mergePane.leadingAnchor],
+		[scroll.trailingAnchor constraintEqualToAnchor:_mergePane.trailingAnchor],
+		[scroll.bottomAnchor constraintEqualToAnchor:_mergePane.bottomAnchor]
+	]];
+	return _mergePane;
+}
+
+/*
+ * Place each title over its side, as DiffView lays them out: each of count
+ * sides gets an equal share of the width after the gaps between them.
+ */
+- (void) layoutPaneTitles:(NSUInteger)count {
+	if (count == _paneTitleCount) return;
+	_paneTitleCount = count;
+	[NSLayoutConstraint deactivateConstraints:_paneTitleConstraints];
+	NSView* detail = _paneTitles[0].superview;
+	NSMutableArray<NSLayoutConstraint*>* constraints = [NSMutableArray array];
+	CGFloat n = (CGFloat)count;
+	for (NSUInteger side = 0; side < count; side++) {
+		NSTextField* title = _paneTitles[side];
+		CGFloat i = (CGFloat)side;
+		if (side == 0) {
+			[constraints addObject:[title.leadingAnchor constraintEqualToAnchor:detail.leadingAnchor constant:12]];
+		} else {
+			/* A side starts at i * (width + kMiddleWidth) / n. */
+			[constraints addObject:[NSLayoutConstraint
+				constraintWithItem:title attribute:NSLayoutAttributeLeading
+				relatedBy:NSLayoutRelationEqual
+				toItem:detail attribute:NSLayoutAttributeTrailing
+				multiplier:i / n constant:i * kMiddleWidth / n + 12]];
+		}
+		if (side + 1 == count) {
+			[constraints addObject:[title.trailingAnchor constraintLessThanOrEqualToAnchor:detail.trailingAnchor constant:-12]];
+		} else {
+			/* Short of the gap before the next side. */
+			[constraints addObject:[NSLayoutConstraint
+				constraintWithItem:title attribute:NSLayoutAttributeTrailing
+				relatedBy:NSLayoutRelationLessThanOrEqual
+				toItem:detail attribute:NSLayoutAttributeTrailing
+				multiplier:(i + 1) / n constant:(i + 1) * kMiddleWidth / n - kMiddleWidth - 8]];
+		}
+	}
+	for (NSUInteger side = 0; side < _paneTitles.count; side++) _paneTitles[side].hidden = side >= count;
+	_paneTitleConstraints = constraints;
+	[NSLayoutConstraint activateConstraints:constraints];
 }
 
 - (void) buildViews {
@@ -321,6 +464,7 @@ static NSColor* status_color(uint8_t status) {
 - (void) documentDidChange {
 	[self synchronizeWindowTitleWithDocumentName];
 	DiffDocument* doc = [self diffDocument];
+	[self showMerge:doc.isMerge];
 	if (doc.generation != _shownGeneration) {
 		_shownGeneration = doc.generation;
 		[self reloadItemsKeepingSelection:doc.reloaded];
@@ -333,6 +477,29 @@ static NSColor* status_color(uint8_t status) {
 - (void) setDocument:(id)document {
 	[super setDocument:document];
 	if (document) [self documentDidChange];
+}
+
+/* Show the merged result under the diff, or not, and the controls that only work for comparisons. */
+- (void) showMerge:(BOOL)show {
+	if (show == _showsMerge) return;
+	_showsMerge = show;
+	_mergePane.hidden = !show;
+	[_mergeSplit adjustSubviews];
+	if (show) [_mergeSplit setPosition:floor(NSHeight(_mergeSplit.bounds) * 0.55) ofDividerAtIndex:0];
+
+	/* A merge has no unified view, and doesn't ignore whitespace, which would load it over. */
+	[_modeControl setEnabled:!show forSegment:kDiffModeUnified];
+	if (show && _diffView.mode == kDiffModeUnified) {
+		_diffView.mode = kDiffModeFluid;
+		_modeControl.selectedSegment = kDiffModeFluid;
+	}
+	_whitespaceCheckbox.enabled = !show;
+	[self layoutPaneTitles:show ? kMaxSides : kSideCount];
+}
+
+/* The merged result's edits are the document's, to undo from anywhere in the window, and to save. */
+- (NSUndoManager*) windowWillReturnUndoManager:(NSWindow*)window {
+	return [self.document undoManager];
 }
 
 /*
@@ -400,6 +567,10 @@ static NSColor* status_color(uint8_t status) {
 		_sidebarTitle.stringValue = @"";
 		return;
 	}
+	if (doc.isMerge) {
+		_sidebarTitle.stringValue = @"Merge";
+		return;
+	}
 	NSUInteger changed = 0;
 	for (SidebarItem* item in _items) {
 		if (!item.isGroup && item.status != DT_STATUS_SAME) changed++;
@@ -410,18 +581,13 @@ static NSColor* status_color(uint8_t status) {
 }
 
 - (void) updatePaneTitles {
-	NSArray<NSString*>* letters = @[@"A", @"B"];
 	DiffDocument* doc = [self diffDocument];
+	if (doc.isMerge) {
+		[self updateMergeTitles];
+		return;
+	}
+	NSArray<NSString*>* letters = @[@"A", @"B"];
 	DtComparison* cmp = doc.comparison;
-	NSDictionary* letterAttributes = @{
-		NSFontAttributeName: [NSFont systemFontOfSize:13 weight:NSFontWeightSemibold],
-		NSForegroundColorAttributeName: [NSColor secondaryLabelColor]
-	};
-	NSDictionary* nameAttributes = @{
-		NSFontAttributeName: [NSFont systemFontOfSize:13],
-		NSForegroundColorAttributeName: [NSColor labelColor]
-	};
-
 	for (NSUInteger side = 0; side < kSideCount; side++) {
 		NSString* name = @"";
 		NSString* path = nil;
@@ -446,12 +612,30 @@ static NSColor* status_color(uint8_t status) {
 			path = url.path;
 		}
 
-		NSMutableAttributedString* title = [[NSMutableAttributedString alloc] initWithString:letters[side] attributes:letterAttributes];
-		NSString* spacedName = [@"   " stringByAppendingString:name];
-		[title appendAttributedString:[[NSAttributedString alloc] initWithString:spacedName attributes:nameAttributes]];
-		_paneTitles[side].attributedStringValue = title;
+		_paneTitles[side].attributedStringValue = pane_title(letters[side], name);
 		_paneTitles[side].toolTip = path.length > 0 ? path : nil;
 	}
+}
+
+/* A merge's sides are its base, A and B, and the merged result's saved to the output. */
+- (void) updateMergeTitles {
+	DiffDocument* doc = [self diffDocument];
+	NSArray<NSString*>* letters = @[@"Base", @"A", @"B"];
+	NSArray<NSURL*>* urls = @[
+		doc.baseURL ? doc.baseURL : (id)[NSNull null],
+		[doc urlForSide:0] ? [doc urlForSide:0] : (id)[NSNull null],
+		[doc urlForSide:1] ? [doc urlForSide:1] : (id)[NSNull null]
+	];
+	for (NSUInteger side = 0; side < kMaxSides; side++) {
+		NSURL* url = [urls[side] isKindOfClass:[NSURL class]] ? urls[side] : nil;
+		NSString* label = side == 0 ? doc.baseLabel : [doc labelForSide:side - 1];
+		NSString* name = label ? label : url.lastPathComponent;
+		_paneTitles[side].attributedStringValue = pane_title(letters[side], name ? name : @"");
+		_paneTitles[side].toolTip = url.path;
+	}
+	NSString* output = doc.outputURL.path;
+	_mergeTitle.attributedStringValue = pane_title(@"Merged", output ? output.lastPathComponent : @"");
+	_mergeTitle.toolTip = output;
 }
 
 - (void) updateMessage {
@@ -520,7 +704,12 @@ static NSColor* status_color(uint8_t status) {
 	_shownEntry = entry;
 	_shownPath = entryPath;
 	_fileMessage = nil;
-	DtComparison* cmp = [self diffDocument].comparison;
+	DiffDocument* doc = [self diffDocument];
+	if (doc.isMerge) {
+		[self showMergeEntry:entry];
+		return;
+	}
+	DtComparison* cmp = doc.comparison;
 	DtFileDiff* diff = NULL;
 	if (entry >= 0 && cmp) {
 		DtDiffOptions options = {(uint32_t)(_ignoreWhitespace ? DT_IGNORE_WHITESPACE : 0), kTabWidth};
@@ -546,9 +735,57 @@ static NSColor* status_color(uint8_t status) {
 	[self updateMessage];
 }
 
+/*
+ * Show a merge of the document's files, its only entry. The merged result is
+ * loaded once for the comparison: a merge isn't reloaded, which would lose its edits.
+ */
+- (void) showMergeEntry:(NSInteger)entry {
+	DiffDocument* doc = [self diffDocument];
+	if (entry < 0 || !doc.comparison || !doc.baseURL || ![doc urlForSide:0] || ![doc urlForSide:1]) {
+		doc.mergedText = nil;
+		_mergeGeneration = NSUIntegerMax;
+		[_diffView setDiff:NULL];
+		[_mergeEditor loadMerge:NULL];
+	} else if (_mergeGeneration != doc.generation) {
+		_mergeGeneration = doc.generation;
+		NSArray<NSURL*>* urls = @[doc.baseURL, [doc urlForSide:0], [doc urlForSide:1]];
+		DtDiffOptions options = {0, kTabWidth};
+		DtFileDiff* diff = dt_merge_new(
+			urls[0].path.fileSystemRepresentation,
+			urls[1].path.fileSystemRepresentation,
+			urls[2].path.fileSystemRepresentation,
+			options);
+		_diffView.fileURLs = urls;
+		[_diffView setDiff:diff keepingPosition:NO];
+		_selectingMerge = YES;
+		if (dt_file_diff_error(diff).len > 0) {
+			_fileMessage = dt_string(dt_file_diff_error(diff));
+			doc.mergedText = nil;
+			[_mergeEditor loadMerge:NULL];
+		} else {
+			[_mergeEditor loadMerge:diff];
+			__weak NSTextView* weakText = _mergeText;
+			doc.mergedText = ^NSString*(void) {
+				return [weakText.string copy];
+			};
+		}
+		[doc.undoManager removeAllActions];
+		[doc updateChangeCount:NSChangeCleared];
+		_mergeText.selectedRange = NSMakeRange(0, 0);
+		_selectingMerge = NO;
+		[self currentHunkDidChange];
+		[_diffView scrollToCurrentHunk];
+	}
+
+	[self updatePaneTitles];
+	[self updateChangeLabel];
+	[self updateMessage];
+}
+
 - (void) dropURLs:(NSArray<NSURL*>*)urls side:(NSInteger)side {
 	DiffDocument* doc = [self diffDocument];
-	if (urls.count == 0) return;
+	/* A merge's files are git's, to merge as it asked. */
+	if (urls.count == 0 || doc.isMerge) return;
 	if (side < 0 || (NSUInteger)side >= kSideCount || urls.count > 1) {
 		[doc setURLs:urls];
 	} else {
@@ -669,7 +906,82 @@ static NSColor* status_color(uint8_t status) {
 	}
 	_diffView.currentHunk = hunk;
 	[_diffView scrollToCurrentHunk];
+	[self currentHunkDidChange];
+}
+
+/* Show the current change in the merged result too. */
+- (void) currentHunkDidChange {
 	[self updateChangeLabel];
+	if (!_showsMerge) return;
+	NSInteger hunk = _diffView.currentHunk;
+	_mergeEditor.currentHunk = hunk;
+	if (hunk >= 0) [_mergeEditor scrollToHunk:hunk];
+}
+
+/* Editing a change in the merged result makes it the current one. */
+- (void) textViewDidChangeSelection:(NSNotification*)notification {
+	if (_selectingMerge || !_showsMerge) return;
+	NSInteger hunk = [_mergeEditor hunkAtLocation:_mergeText.selectedRange.location];
+	if (hunk < 0 || hunk == _diffView.currentHunk) return;
+	_diffView.currentHunk = hunk;
+	[_diffView scrollToCurrentHunk];
+	_mergeEditor.currentHunk = hunk;
+	[self updateChangeLabel];
+}
+
+#pragma mark Merging
+
+- (IBAction) takeA:(id)sender {
+	[self takeVersions:@[@(DT_VERSION_A)] actionName:@"Take A"];
+}
+
+- (IBAction) takeB:(id)sender {
+	[self takeVersions:@[@(DT_VERSION_B)] actionName:@"Take B"];
+}
+
+- (IBAction) takeAThenB:(id)sender {
+	[self takeVersions:@[@(DT_VERSION_A), @(DT_VERSION_B)] actionName:@"Take A then B"];
+}
+
+- (IBAction) takeBThenA:(id)sender {
+	[self takeVersions:@[@(DT_VERSION_B), @(DT_VERSION_A)] actionName:@"Take B then A"];
+}
+
+/* Back to how the merge first had it: a side's change, or the conflict between them. */
+- (IBAction) resetChange:(id)sender {
+	[self takeVersions:@[@(DT_VERSION_MERGED)] actionName:@"Reset Change"];
+}
+
+- (void) takeVersions:(NSArray<NSNumber*>*)versions actionName:(NSString*)name {
+	NSInteger hunk = _diffView.currentHunk;
+	if (![self canTakeVersions]) return;
+	_selectingMerge = YES;
+	[_mergeEditor replaceHunk:hunk withVersions:versions actionName:name];
+	_selectingMerge = NO;
+	[_mergeEditor scrollToHunk:hunk];
+}
+
+- (BOOL) canTakeVersions {
+	return _showsMerge && [self diffDocument].mergedText && _diffView.currentHunk >= 0;
+}
+
+#pragma mark Split view
+
+- (BOOL) splitView:(NSSplitView*)splitView shouldHideDividerAtIndex:(NSInteger)dividerIndex {
+	return !_showsMerge;
+}
+
+- (CGFloat) splitView:(NSSplitView*)splitView constrainMinCoordinate:(CGFloat)proposed ofSubviewAt:(NSInteger)dividerIndex {
+	return fmax(proposed, kMinDiffHeight);
+}
+
+- (CGFloat) splitView:(NSSplitView*)splitView constrainMaxCoordinate:(CGFloat)proposed ofSubviewAt:(NSInteger)dividerIndex {
+	return fmin(proposed, NSHeight(splitView.bounds) - kMinMergeHeight);
+}
+
+/* Give the diff the window's change in height, and keep the merged result's. */
+- (BOOL) splitView:(NSSplitView*)splitView shouldAdjustSizeOfSubview:(NSView*)view {
+	return view == _diffView || !_showsMerge;
 }
 
 - (IBAction) showBlocks:(id)sender {
@@ -689,6 +1001,10 @@ static NSColor* status_color(uint8_t status) {
 }
 
 - (void) setDiffMode:(NSInteger)mode {
+	if (_showsMerge && mode == kDiffModeUnified) {
+		_modeControl.selectedSegment = _diffView.mode;
+		return;
+	}
 	_diffView.mode = mode;
 	_modeControl.selectedSegment = mode;
 	[[NSUserDefaults standardUserDefaults] setInteger:mode forKey:kDiffModeDefault];
@@ -696,7 +1012,43 @@ static NSColor* status_color(uint8_t status) {
 
 - (IBAction) toggleWrapLines:(id)sender {
 	_diffView.wrapsLines = !_diffView.wrapsLines;
+	[self updateMergeWrapping];
 	[[NSUserDefaults standardUserDefaults] setBool:_diffView.wrapsLines forKey:kWrapLinesDefault];
+}
+
+/* The merged result wraps its lines as the diff does. */
+- (void) updateMergeWrapping {
+	NSScrollView* scroll = _mergeText.enclosingScrollView;
+	NSTextContainer* container = _mergeText.textContainer;
+	BOOL wraps = _diffView.wrapsLines;
+	scroll.hasHorizontalScroller = !wraps;
+	_mergeText.horizontallyResizable = !wraps;
+	_mergeText.maxSize = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
+	container.widthTracksTextView = wraps;
+	if (wraps) {
+		[_mergeText setFrameSize:NSMakeSize(scroll.contentSize.width, NSHeight(_mergeText.frame))];
+		container.size = NSMakeSize(scroll.contentSize.width, CGFLOAT_MAX);
+	} else {
+		container.size = NSMakeSize(CGFLOAT_MAX, CGFLOAT_MAX);
+	}
+	[_mergeText sizeToFit];
+}
+
+/* The merged result in the diff's font, with its tab stops. */
+- (void) updateMergeFont {
+	NSFont* font = [NSFont monospacedSystemFontOfSize:_diffView.fontSize weight:NSFontWeightRegular];
+	NSMutableParagraphStyle* paragraph = [[NSMutableParagraphStyle alloc] init];
+	paragraph.tabStops = @[];
+	paragraph.defaultTabInterval = [@"0" sizeWithAttributes:@{NSFontAttributeName: font}].width * kTabWidth;
+	NSDictionary* attributes = @{
+		NSFontAttributeName: font,
+		NSParagraphStyleAttributeName: paragraph,
+		NSForegroundColorAttributeName: [NSColor textColor]
+	};
+	_mergeText.typingAttributes = attributes;
+	_mergeText.defaultParagraphStyle = paragraph;
+	NSTextStorage* storage = _mergeText.textStorage;
+	[storage setAttributes:attributes range:NSMakeRange(0, storage.length)];
 }
 
 - (IBAction) toggleIgnoreWhitespace:(id)sender {
@@ -716,12 +1068,14 @@ static NSColor* status_color(uint8_t status) {
 - (void) setTextSize:(CGFloat)size {
 	if (size < 8 || size > 36) return;
 	_diffView.fontSize = size;
+	[self updateMergeFont];
 }
 
 - (BOOL) validateMenuItem:(NSMenuItem*)menuItem {
 	SEL action = menuItem.action;
 	if (action == @selector(toggleIgnoreWhitespace:)) {
 		menuItem.state = _ignoreWhitespace ? NSControlStateValueOn : NSControlStateValueOff;
+		return !_showsMerge;
 	} else if (action == @selector(toggleWrapLines:)) {
 		menuItem.state = _diffView.wrapsLines ? NSControlStateValueOn : NSControlStateValueOff;
 	} else if (action == @selector(showBlocks:)) {
@@ -730,6 +1084,10 @@ static NSColor* status_color(uint8_t status) {
 		menuItem.state = _diffView.mode == kDiffModeFluid ? NSControlStateValueOn : NSControlStateValueOff;
 	} else if (action == @selector(showUnified:)) {
 		menuItem.state = _diffView.mode == kDiffModeUnified ? NSControlStateValueOn : NSControlStateValueOff;
+		return !_showsMerge;
+	} else if (action == @selector(takeA:) || action == @selector(takeB:) || action == @selector(takeAThenB:)
+		|| action == @selector(takeBThenA:) || action == @selector(resetChange:)) {
+		return [self canTakeVersions];
 	} else if (action == @selector(previousChange:) || action == @selector(nextChange:)) {
 		/*
 		 * Enabled even with no change to move to, so their keys don't fall through

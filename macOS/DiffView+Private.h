@@ -1,4 +1,4 @@
-/* What the parts of a DiffView share: DiffView.m, DiffPaneView.m, DiffGutterView.m and DiffConnectorView.m. */
+/* What the parts of a DiffView share: DiffView.m, DiffPaneView.m, DiffGutterView.m and DiffConnectorView.m; and its colors, with MergeEditor.m. */
 
 #import <CoreText/CoreText.h>
 
@@ -9,20 +9,20 @@ static const CGFloat kGutterPadding = 8;
 static const CGFloat kTextPadding = 8;
 static const CGFloat kUnifiedLetterWidth = 14;
 
-/* Colors, indexed by DtLine.kind. */
-extern NSColor* g_line_colors[4];
+/* The number of DtLine.kind values, which also color hunks by DtHunk.kind. */
+#define kKindCount 5
+
+/* Colors, indexed by DtLine.kind and DtHunk.kind. */
+extern NSColor* g_line_colors[kKindCount];
 /* For the lines of the current hunk. */
-extern NSColor* g_current_line_colors[4];
-extern NSColor* g_emphasis_colors[4];
-extern NSColor* g_edge_colors[4];
+extern NSColor* g_current_line_colors[kKindCount];
+extern NSColor* g_emphasis_colors[kKindCount];
+extern NSColor* g_edge_colors[kKindCount];
 extern NSColor* g_filler_color;
 extern NSColor* g_middle_color;
 
 /* The background of a changed line, or the band joining a hunk across sides. */
 NSColor* line_color(uint8_t kind, BOOL inCurrentHunk);
-
-/* The kind of line that colors a hunk: changed, or only removed or added. */
-uint8_t hunk_kind(DtHunk hunk);
 
 static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	return a < b ? a : b;
@@ -46,6 +46,8 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	@property (nonatomic, readonly) CGFloat unifiedColumnWidth;
 	/* The widest line of any side. */
 	@property (nonatomic, readonly) uint32_t maxColumns;
+	/* The sides the diff has: 2, or 3 for a merge. */
+	@property (nonatomic, readonly) NSUInteger sideCount;
 
 	/*
 	 * The layout. Each line takes a line height, or several when wrapped. In

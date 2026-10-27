@@ -2,6 +2,7 @@
 
 pub mod diff;
 pub mod ffi;
+pub mod merge;
 pub mod text;
 pub mod tree;
 
