@@ -21,8 +21,8 @@
 # Keep this file working with the GNU Make 3.81 that ships with macOS.
 
 APP_NAME    := Diff-o-tron
-APP_VERSION := 0.1
-APP_BUILD   := 1
+APP_VERSION := 0.2
+APP_BUILD   := 2
 
 CONFIG ?= debug
 
