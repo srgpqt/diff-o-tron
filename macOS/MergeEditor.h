@@ -15,6 +15,10 @@
 	- (NSInteger) hunkAtLocation:(NSUInteger)location;
 	/* Whether a change is a conflict still unresolved: one with git's conflict markers in it. */
 	- (BOOL) hunkHasConflictMarkers:(NSInteger)hunk;
+	/* How many changes are conflicts still unresolved, counted as the changes are colored. */
+	@property (nonatomic, readonly) NSUInteger conflictCount;
+	/* Called when conflictCount changes. */
+	@property (nonatomic, copy) void (^conflictCountChanged)(void);
 	- (void) scrollToHunk:(NSInteger)hunk;
 	/* Undoably replace a change's text with versions of it (DT_VERSION_*), one after another. */
 	- (void) replaceHunk:(NSInteger)hunk withVersions:(NSArray<NSNumber*>*)versions actionName:(NSString*)name;

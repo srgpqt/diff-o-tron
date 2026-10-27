@@ -98,6 +98,8 @@ static NSColor* status_color(uint8_t status) {
 	BOOL _selectingMerge;
 	NSTextField* _message;
 	NSTextField* _changeLabel;
+	/* For a merge: how many conflicts are left to resolve. */
+	NSTextField* _conflictLabel;
 	NSButton* _previousButton;
 	NSButton* _nextButton;
 	NSButton* _whitespaceCheckbox;
@@ -215,6 +217,8 @@ static NSColor* status_color(uint8_t status) {
 	_whitespaceCheckbox = [NSButton checkboxWithTitle:@"Ignore whitespace" target:self action:@selector(toggleIgnoreWhitespace:)];
 	_changeLabel = [NSTextField labelWithString:@""];
 	_changeLabel.textColor = [NSColor secondaryLabelColor];
+	_conflictLabel = [NSTextField labelWithString:@""];
+	_conflictLabel.hidden = YES;
 	_previousButton = [NSButton
 		buttonWithImage:[NSImage imageWithSystemSymbolName:@"chevron.up" accessibilityDescription:@"Previous Change"]
 		target:self
@@ -235,6 +239,7 @@ static NSColor* status_color(uint8_t status) {
 	bar.spacing = 12;
 	[bar addView:_modeControl inGravity:NSStackViewGravityLeading];
 	[bar addView:_whitespaceCheckbox inGravity:NSStackViewGravityTrailing];
+	[bar addView:_conflictLabel inGravity:NSStackViewGravityTrailing];
 	[bar addView:_changeLabel inGravity:NSStackViewGravityTrailing];
 	[bar addView:_previousButton inGravity:NSStackViewGravityTrailing];
 	[bar addView:_nextButton inGravity:NSStackViewGravityTrailing];
@@ -327,6 +332,10 @@ static NSColor* status_color(uint8_t status) {
 	_mergeText.textContainerInset = NSMakeSize(4, 4);
 	_mergeText.delegate = self;
 	_mergeEditor = [[MergeEditor alloc] initWithTextView:_mergeText];
+	__weak DiffWindowController* weakSelf = self;
+	_mergeEditor.conflictCountChanged = ^(void) {
+		[weakSelf updateConflictLabel];
+	};
 	[self updateMergeFont];
 	[self updateMergeWrapping];
 
@@ -494,6 +503,7 @@ static NSColor* status_color(uint8_t status) {
 		_modeControl.selectedSegment = kDiffModeFluid;
 	}
 	_whitespaceCheckbox.enabled = !show;
+	[self updateConflictLabel];
 	[self layoutPaneTitles:show ? kMaxSides : kSideCount];
 }
 
@@ -674,6 +684,23 @@ static NSColor* status_color(uint8_t status) {
 	}
 	_previousButton.enabled = current > 0;
 	_nextButton.enabled = count > 0 && (size_t)(current + 1) < count;
+	[self updateConflictLabel];
+}
+
+/* A merge's conflicts left, in orange while there are any. */
+- (void) updateConflictLabel {
+	BOOL shown = _showsMerge && [self diffDocument].mergedText && !_fileMessage;
+	_conflictLabel.hidden = !shown;
+	if (!shown) return;
+	NSUInteger count = _mergeEditor.conflictCount;
+	if (count == 0) {
+		_conflictLabel.stringValue = @"No conflicts left";
+	} else if (count == 1) {
+		_conflictLabel.stringValue = @"1 conflict left";
+	} else {
+		_conflictLabel.stringValue = [NSString stringWithFormat:@"%lu conflicts left", (unsigned long)count];
+	}
+	_conflictLabel.textColor = count > 0 ? [NSColor systemOrangeColor] : [NSColor secondaryLabelColor];
 }
 
 #pragma mark Showing files

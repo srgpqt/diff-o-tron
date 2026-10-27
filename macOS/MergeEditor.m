@@ -158,17 +158,23 @@ BOOL has_conflict_markers(NSString* text) {
 	});
 }
 
-/* Color the changes: conflicts with their markers still in them, and the rest. */
+/* Color the changes: conflicts with their markers still in them, and the rest. And count the conflicts. */
 - (void) highlight {
 	NSTextView* textView = _textView;
 	NSLayoutManager* layoutManager = textView.layoutManager;
 	NSUInteger length = textView.textStorage.length;
+	NSUInteger conflicts = 0;
 	[layoutManager removeTemporaryAttribute:NSBackgroundColorAttributeName forCharacterRange:NSMakeRange(0, length)];
 	for (MergeSegment* segment in _segments) {
 		if (segment.hunk < 0 || segment.range.length == 0 || NSMaxRange(segment.range) > length) continue;
-		uint8_t kind = [self segmentHasConflictMarkers:segment] ? DT_LINE_CONFLICT : DT_LINE_CHANGED;
-		NSColor* color = line_color(kind, segment.hunk == _currentHunk);
+		BOOL conflict = [self segmentHasConflictMarkers:segment];
+		if (conflict) conflicts++;
+		NSColor* color = line_color(conflict ? DT_LINE_CONFLICT : DT_LINE_CHANGED, segment.hunk == _currentHunk);
 		[layoutManager addTemporaryAttribute:NSBackgroundColorAttributeName value:color forCharacterRange:segment.range];
+	}
+	if (conflicts != _conflictCount) {
+		_conflictCount = conflicts;
+		if (_conflictCountChanged) _conflictCountChanged();
 	}
 }
 
