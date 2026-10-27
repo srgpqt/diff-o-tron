@@ -931,6 +931,34 @@ static NSColor* status_color(uint8_t status) {
 
 #pragma mark Merging
 
+- (IBAction) previousConflict:(id)sender {
+	[self moveConflict:-1];
+}
+
+- (IBAction) nextConflict:(id)sender {
+	[self moveConflict:1];
+}
+
+/* Move to the next conflict still unresolved in the merged result, skipping the other changes. */
+- (void) moveConflict:(NSInteger)step {
+	DtFileDiff* diff = _diffView.diff;
+	if (!_showsMerge || !diff) return;
+	NSInteger count = (NSInteger)dt_file_diff_hunk_count(diff);
+	NSInteger current = _diffView.currentHunk;
+	if (current < 0) current = step > 0 ? -1 : count;
+	for (NSInteger hunk = current + step; hunk >= 0 && hunk < count; hunk += step) {
+		if ([_mergeEditor hunkHasConflictMarkers:hunk]) {
+			_diffView.currentHunk = hunk;
+			[_diffView scrollToCurrentHunk];
+			[self currentHunkDidChange];
+			return;
+		}
+	}
+	/* No conflict further on: show where the current change is instead. */
+	[_diffView scrollToCurrentHunk];
+	[_diffView flashCurrentHunk];
+}
+
 - (IBAction) takeA:(id)sender {
 	[self takeVersions:@[@(DT_VERSION_A)] actionName:@"Take A"];
 }
@@ -1088,6 +1116,9 @@ static NSColor* status_color(uint8_t status) {
 	} else if (action == @selector(takeA:) || action == @selector(takeB:) || action == @selector(takeAThenB:)
 		|| action == @selector(takeBThenA:) || action == @selector(resetChange:)) {
 		return [self canTakeVersions];
+	} else if (action == @selector(previousConflict:) || action == @selector(nextConflict:)) {
+		/* Enabled with no conflict to move to, to show there's none, as for changes. */
+		return _showsMerge && [self diffDocument].mergedText != nil;
 	} else if (action == @selector(previousChange:) || action == @selector(nextChange:)) {
 		/*
 		 * Enabled even with no change to move to, so their keys don't fall through

@@ -92,6 +92,11 @@ BOOL has_conflict_markers(NSString* text) {
 	_textView.selectedRange = NSMakeRange(range.location, 0);
 }
 
+- (BOOL) hunkHasConflictMarkers:(NSInteger)hunk {
+	MergeSegment* segment = [self segmentOfHunk:hunk];
+	return segment && NSMaxRange(segment.range) <= _textView.textStorage.length && [self segmentHasConflictMarkers:segment];
+}
+
 - (BOOL) segmentHasConflictMarkers:(MergeSegment*)segment {
 	return has_conflict_markers([_textView.string substringWithRange:segment.range]);
 }

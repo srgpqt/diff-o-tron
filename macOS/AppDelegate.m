@@ -118,6 +118,9 @@ static void build_main_menu(NSApplication* app) {
 
 	/* Merge menu: replacing the current change in the merged result. */ {
 		NSMenu* mergeMenu = add_menu(mainMenu, @"Merge");
+		[mergeMenu addItem:with_modifiers(_(@"Previous Conflict", @selector(previousConflict:), up), optionCommand)];
+		[mergeMenu addItem:with_modifiers(_(@"Next Conflict", @selector(nextConflict:), down), optionCommand)];
+		[mergeMenu addItem:[NSMenuItem separatorItem]];
 		[mergeMenu addItem:with_modifiers(_(@"Take A", @selector(takeA:), left), command)];
 		[mergeMenu addItem:with_modifiers(_(@"Take B", @selector(takeB:), right), command)];
 		[mergeMenu addItem:with_modifiers(_(@"Take A then B", @selector(takeAThenB:), right), optionCommand)];
