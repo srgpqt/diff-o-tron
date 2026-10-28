@@ -1,5 +1,7 @@
 #import "Common.h"
 
+@class MergeEditor;
+
 /* The document type of comparisons. */
 static NSString* const kComparisonType = @"Comparison";
 
@@ -37,7 +39,7 @@ static NSString* const kComparisonType = @"Comparison";
 	/* labels: the base's, A's and B's, empty strings for none. */
 	- (void) setMergeBase:(NSURL*)base a:(NSURL*)a b:(NSURL*)b output:(NSURL*)output labels:(NSArray<NSString*>*)labels;
 	/* The merged result to save, from the window that edits it; nil while there's none. */
-	@property (nonatomic, copy) NSString* (^mergedText)(void);
+	@property (nonatomic, weak) MergeEditor* mergeEditor;
 	/* Write the merged result to the output file, and tell the diffotron command whether it has conflicts left. */
 	- (BOOL) saveMerge:(NSError**)error;
 @end

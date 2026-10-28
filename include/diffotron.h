@@ -20,11 +20,18 @@ extern "C" {
 typedef struct DtComparison DtComparison;
 typedef struct DtFileDiff DtFileDiff;
 typedef struct DtLayout DtLayout;
+typedef struct DtMergeResult DtMergeResult;
 
 typedef struct {
 	const char *ptr;
 	size_t len;
 } DtStr;
+
+/* UTF-16 text, in code units. */
+typedef struct {
+	const uint16_t *ptr;
+	size_t len;
+} DtStr16;
 
 /* DtEntry.status */
 enum {
@@ -197,6 +204,41 @@ DtHunk dt_file_diff_hunk(const DtFileDiff *diff, size_t index);
 size_t dt_merge_chunk_count(const DtFileDiff *diff);
 DtMergeChunk dt_merge_chunk(const DtFileDiff *diff, size_t index);
 DtStr dt_merge_chunk_text(const DtFileDiff *diff, size_t index, uint8_t version);
+
+/*
+ * A merge's merged result as the front end's text editor edits it, as the merge
+ * starts it: a copy of the text, told of each edit, keeping track of where each
+ * change is in it, finding the conflicts left unresolved, and saving it as the
+ * file was, in its encoding and with its line breaks. Its changes are the
+ * merge's hunks. Positions and lengths are in UTF-16 code units.
+ *
+ * Empty for a diff of two files. Never returns NULL.
+ */
+DtMergeResult *dt_merge_result_new(const DtFileDiff *merge);
+void dt_merge_result_free(DtMergeResult *result);
+/* The text, valid until the next edit. */
+DtStr16 dt_merge_result_text(const DtMergeResult *result);
+/* The text was edited: length units from start replaced with text_len of text. */
+void dt_merge_result_replace(DtMergeResult *result, size_t start, size_t length, const uint16_t *text, size_t text_len);
+size_t dt_merge_result_hunk_count(const DtMergeResult *result);
+/* The change at a position, or past the end, the last; -1 for none, where the merge left the lines unchanged. */
+ptrdiff_t dt_merge_result_hunk_at(const DtMergeResult *result, size_t position);
+/* Where a change's text is: false if there's no such change. */
+bool dt_merge_result_hunk_range(const DtMergeResult *result, size_t hunk, size_t *start, size_t *length);
+/* A change's text in a version, DT_VERSION_*, to take that version. */
+DtStr dt_merge_result_version(const DtMergeResult *result, size_t hunk, uint8_t version);
+/* Whether a change is a conflict still unresolved: with git's conflict markers in it. */
+bool dt_merge_result_unresolved(const DtMergeResult *result, size_t hunk);
+size_t dt_merge_result_conflict_count(const DtMergeResult *result);
+/* Whether a line of the text starts with git's conflict marker. */
+bool dt_merge_result_has_conflict_markers(const DtMergeResult *result);
+/*
+ * Write the text to a file, given as a NUL-terminated UTF-8 path, in place
+ * rather than atomically. On failure, returns false, with dt_merge_result_error
+ * saying why, such as characters the file's encoding can't hold.
+ */
+bool dt_merge_result_save(DtMergeResult *result, const char *path);
+DtStr dt_merge_result_error(const DtMergeResult *result); /* empty if none */
 
 /*
  * The layout of a diff's views, in points down the document, from how tall the

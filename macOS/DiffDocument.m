@@ -64,18 +64,16 @@ static id path_url(NSURL* url) {
 }
 
 - (BOOL) saveMerge:(NSError**)error {
-	NSString* text = _isMerge && _mergedText ? _mergedText() : nil;
-	if (!text || !_outputURL) {
+	MergeEditor* editor = _isMerge ? _mergeEditor : nil;
+	if (!editor || !_outputURL) {
 		if (error) *error = [NSError errorWithDomain:NSCocoaErrorDomain code:NSFileWriteUnknownError userInfo:nil];
 		return NO;
 	}
-	/* Not atomically, which would need to write to the output's folder, where the sandbox doesn't let the app. */
-	NSData* data = [text dataUsingEncoding:NSUTF8StringEncoding];
-	if (![data writeToURL:_outputURL options:0 error:error]) return NO;
+	/* In place, as atomically would need to write to the output's folder, where the sandbox doesn't let the app. */
+	if (![editor saveToURL:_outputURL error:error]) return NO;
 	[self updateChangeCount:NSChangeCleared];
 	if (_closeToken) {
-		BOOL resolved = !has_conflict_markers(text);
-		post_request_notification(resolved ? kMergedNotification : kUnresolvedNotification, _closeToken);
+		post_request_notification(editor.hasConflictMarkers ? kUnresolvedNotification : kMergedNotification, _closeToken);
 	}
 	return YES;
 }
@@ -86,7 +84,7 @@ static id path_url(NSURL* url) {
 }
 
 - (BOOL) validateUserInterfaceItem:(id<NSValidatedUserInterfaceItem>)item {
-	if (item.action == @selector(saveDocument:)) return _isMerge && _mergedText != nil;
+	if (item.action == @selector(saveDocument:)) return _isMerge && _mergeEditor != nil;
 	return [super validateUserInterfaceItem:item];
 }
 

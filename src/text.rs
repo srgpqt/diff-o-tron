@@ -15,6 +15,8 @@ pub struct Text {
     /// Byte ranges of each line in `content`, including its terminator.
     pub lines: Vec<Range<usize>>,
     pub binary: bool,
+    /// Whether it wasn't UTF-8, and so was read as Latin-1.
+    pub latin1: bool,
     /// The raw bytes, kept only for binary files so they can still be compared.
     pub bytes: Vec<u8>,
 }
@@ -29,10 +31,10 @@ impl Text {
         if sniff.contains(&0) {
             return Text { binary: true, bytes, ..Text::default() };
         }
-        let content = match String::from_utf8(bytes) {
-            Ok(s) => s,
+        let (content, latin1) = match String::from_utf8(bytes) {
+            Ok(s) => (s, false),
             // Not UTF-8: show it as Latin-1, which maps every byte to a character.
-            Err(e) => e.into_bytes().iter().map(|&b| b as char).collect(),
+            Err(e) => (e.into_bytes().iter().map(|&b| b as char).collect(), true),
         };
         let mut lines = Vec::new();
         let mut start = 0;
@@ -40,7 +42,14 @@ impl Text {
             lines.push(start..start + line.len());
             start += line.len();
         }
-        Text { content, lines, binary: false, bytes: Vec::new() }
+        Text { content, lines, binary: false, latin1, bytes: Vec::new() }
+    }
+
+    /// Whether every line break is `\r\n`, or `None` if there are none.
+    pub fn crlf(&self) -> Option<bool> {
+        let mut breaks = self.raw_lines().filter(|line| line.ends_with('\n')).peekable();
+        breaks.peek()?;
+        Some(breaks.all(|line| line.ends_with("\r\n")))
     }
 
     /// A line including its terminator, as used for matching lines.
@@ -112,9 +121,18 @@ mod tests {
     }
 
     #[test]
+    fn line_endings() {
+        assert_eq!(Text::from_bytes(b"a\r\nb\r\nc".to_vec()).crlf(), Some(true));
+        assert_eq!(Text::from_bytes(b"a\r\nb\n".to_vec()).crlf(), Some(false));
+        assert_eq!(Text::from_bytes(b"a".to_vec()).crlf(), None);
+    }
+
+    #[test]
     fn decodes_non_utf8_as_latin1() {
         let t = Text::from_bytes(vec![b'c', b'a', b'f', 0xe9]);
         assert_eq!(t.line(0), "café");
+        assert!(t.latin1);
+        assert!(!Text::from_bytes("café".into()).latin1);
     }
 
     #[cfg(unix)]

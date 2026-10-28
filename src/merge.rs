@@ -48,6 +48,11 @@ pub struct Merge {
     pub chunks: Vec<Chunk>,
     /// Each chunk's text in each version.
     pub texts: Vec<[String; 4]>,
+    /// Whether the merged result's line breaks are `\r\n`: if the base's all are, or A's if the
+    /// base has none.
+    pub crlf: bool,
+    /// Whether to save the merged result as Latin-1, as side A was read.
+    pub latin1: bool,
     pub error: Option<String>,
 }
 
@@ -71,7 +76,9 @@ impl Merge {
         if base.binary || a.binary || b.binary {
             return Merge { error: Some("Binary files can't be merged.".into()), ..Merge::default() };
         }
-        let eol = if base.content.contains("\r\n") { "\r\n" } else { "\n" };
+        let crlf = base.crlf().or(a.crlf()).unwrap_or(false);
+        let latin1 = a.latin1;
+        let eol = if crlf { "\r\n" } else { "\n" };
         let mut changes: Vec<Change> = Vec::new();
         for (side, other) in [(A, &a), (B, &b)] {
             for (before, after) in line_hunks(&base, other, options.ignore_whitespace) {
@@ -86,6 +93,8 @@ impl Merge {
                 Side::new(a, options.tab_width),
                 Side::new(b, options.tab_width),
             ],
+            crlf,
+            latin1,
             ..Merge::default()
         };
 

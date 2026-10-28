@@ -1,9 +1,9 @@
 #import "Common.h"
 
 /*
- * A merge's merged result, in a text view: keeps track of where each chunk of
- * the merge is as the text is edited, colors the changes, and replaces them
- * with versions of them.
+ * A merge's merged result, in a text view: tells the core's DtMergeResult of
+ * each edit, which keeps track of where each change is, colors the changes,
+ * replaces them with versions of them, and saves the result.
  */
 @interface MergeEditor : NSObject <NSTextStorageDelegate>
 	- (instancetype) initWithTextView:(NSTextView*)textView;
@@ -22,7 +22,8 @@
 	- (void) scrollToHunk:(NSInteger)hunk;
 	/* Undoably replace a change's text with versions of it (DT_VERSION_*), one after another. */
 	- (void) replaceHunk:(NSInteger)hunk withVersions:(NSArray<NSNumber*>*)versions actionName:(NSString*)name;
+	/* Whether a line of the text starts with git's conflict marker, as an unresolved conflict's does. */
+	@property (nonatomic, readonly) BOOL hasConflictMarkers;
+	/* Write the text to a file, in place, as the file was: in its encoding, with its line breaks. */
+	- (BOOL) saveToURL:(NSURL*)url error:(NSError**)error;
 @end
-
-/* Whether a line starts with git's conflict marker, as an unresolved conflict's does. */
-BOOL has_conflict_markers(NSString* text);

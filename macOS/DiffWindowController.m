@@ -695,7 +695,7 @@ static NSColor* status_color(uint8_t status) {
 
 /* A merge's conflicts left, in orange while there are any. */
 - (void) updateConflictLabel {
-	BOOL shown = _showsMerge && [self diffDocument].mergedText && !_fileMessage;
+	BOOL shown = _showsMerge && [self diffDocument].mergeEditor && !_fileMessage;
 	_conflictLabel.hidden = !shown;
 	if (!shown) return;
 	NSUInteger count = _mergeEditor.conflictCount;
@@ -775,7 +775,7 @@ static NSColor* status_color(uint8_t status) {
 - (void) showMergeEntry:(NSInteger)entry {
 	DiffDocument* doc = [self diffDocument];
 	if (entry < 0 || !doc.comparison || !doc.baseURL || ![doc urlForSide:0] || ![doc urlForSide:1]) {
-		doc.mergedText = nil;
+		doc.mergeEditor = nil;
 		_mergeGeneration = NSUIntegerMax;
 		[_diffView setDiff:NULL];
 		[_mergeEditor loadMerge:NULL];
@@ -793,14 +793,11 @@ static NSColor* status_color(uint8_t status) {
 		_selectingMerge = YES;
 		if (dt_file_diff_error(diff).len > 0) {
 			_fileMessage = dt_string(dt_file_diff_error(diff));
-			doc.mergedText = nil;
+			doc.mergeEditor = nil;
 			[_mergeEditor loadMerge:NULL];
 		} else {
 			[_mergeEditor loadMerge:diff];
-			__weak NSTextView* weakText = _mergeText;
-			doc.mergedText = ^NSString*(void) {
-				return [weakText.string copy];
-			};
+			doc.mergeEditor = _mergeEditor;
 		}
 		[doc.undoManager removeAllActions];
 		[doc updateChangeCount:NSChangeCleared];
@@ -1023,7 +1020,7 @@ static NSColor* status_color(uint8_t status) {
 }
 
 - (BOOL) canTakeVersions {
-	return _showsMerge && [self diffDocument].mergedText && _diffView.currentHunk >= 0;
+	return _showsMerge && [self diffDocument].mergeEditor && _diffView.currentHunk >= 0;
 }
 
 #pragma mark Split view
@@ -1152,7 +1149,7 @@ static NSColor* status_color(uint8_t status) {
 		return [self canTakeVersions];
 	} else if (action == @selector(previousConflict:) || action == @selector(nextConflict:)) {
 		/* Enabled with no conflict to move to, to show there's none, as for changes. */
-		return _showsMerge && [self diffDocument].mergedText != nil;
+		return _showsMerge && [self diffDocument].mergeEditor != nil;
 	} else if (action == @selector(previousChange:) || action == @selector(nextChange:)) {
 		/*
 		 * Enabled even with no change to move to, so their keys don't fall through

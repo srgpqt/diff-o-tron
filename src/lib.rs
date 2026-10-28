@@ -5,6 +5,7 @@ pub mod ffi;
 pub mod fluid;
 pub mod layout;
 pub mod merge;
+pub mod merge_result;
 pub mod text;
 pub mod tree;
 

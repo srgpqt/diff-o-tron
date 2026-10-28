@@ -35,6 +35,16 @@ static void write_file(const char *path, const char *contents) {
 	fclose(f);
 }
 
+/* Whether a file holds exactly expected. */
+static int file_eq(const char *path, const char *expected) {
+	char contents[4096];
+	FILE *f = fopen(path, "rb");
+	if (!f) return 0;
+	size_t len = fread(contents, 1, sizeof contents, f);
+	fclose(f);
+	return len == strlen(expected) && memcmp(contents, expected, len) == 0;
+}
+
 int main(int argc, char **argv) {
 	if (argc != 2) {
 		fprintf(stderr, "usage: %s <scratch directory>\n", argv[0]);
@@ -177,6 +187,32 @@ int main(int argc, char **argv) {
 	CHECK(str_eq(dt_merge_chunk_text(merge, 1, DT_VERSION_A), "TWO\n"));
 	CHECK(str_eq(dt_merge_chunk_text(merge, 1, DT_VERSION_MERGED), "<<<<<<< A\nTWO\n=======\n2\n>>>>>>> B\n"));
 	CHECK(str_eq(dt_merge_chunk_text(merge, 3, DT_VERSION_MERGED), "5\n"));
+
+	/* The merged result: take A for the conflict, then save it. */
+	DtMergeResult *result = dt_merge_result_new(merge);
+	CHECK(dt_merge_result_hunk_count(result) == 2);
+	CHECK(dt_merge_result_conflict_count(result) == 1 && dt_merge_result_has_conflict_markers(result));
+	CHECK(dt_merge_result_unresolved(result, 0) && !dt_merge_result_unresolved(result, 1));
+	CHECK(dt_merge_result_hunk_at(result, 0) == -1 && dt_merge_result_hunk_at(result, 4) == 0);
+	size_t start = 0, length = 0;
+	CHECK(dt_merge_result_hunk_range(result, 0, &start, &length) && start == 4 && length == 34);
+	CHECK(!dt_merge_result_hunk_range(result, 9, &start, &length));
+	DtStr taken = dt_merge_result_version(result, 0, DT_VERSION_A);
+	CHECK(str_eq(taken, "TWO\n"));
+	CHECK(dt_merge_result_hunk_range(result, 0, &start, &length));
+	const uint16_t two[] = {'T', 'W', 'O', '\n'};
+	dt_merge_result_replace(result, start, length, two, 4);
+	CHECK(dt_merge_result_conflict_count(result) == 0 && !dt_merge_result_has_conflict_markers(result));
+	CHECK(dt_merge_result_text(result).len == 21);
+	char path_merged[4096];
+	snprintf(path_merged, sizeof path_merged, "%s/merged.txt", argv[1]);
+	CHECK(dt_merge_result_save(result, path_merged));
+	CHECK(dt_merge_result_error(result).len == 0);
+	CHECK(file_eq(path_merged, "one\nTWO\nthree\nfour\n5\n"));
+	CHECK(!dt_merge_result_save(result, "/nonexistent/diffotron/merged.txt"));
+	CHECK(dt_merge_result_error(result).len > 0);
+	dt_merge_result_free(result);
+	dt_merge_result_free(NULL);
 	dt_file_diff_free(merge);
 
 	if (failures) {

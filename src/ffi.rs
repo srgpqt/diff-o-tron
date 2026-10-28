@@ -9,6 +9,7 @@ use std::ptr;
 use crate::diff::{FileDiff, LineKind, Options, Side, Span};
 use crate::layout::{self, Anchor, Layout, Table};
 use crate::merge::{self, ChunkKind, Merge};
+use crate::merge_result::MergeResult;
 use crate::tree::{Comparison, Status};
 
 pub struct DtComparison(Comparison);
@@ -593,4 +594,118 @@ pub extern "C" fn dt_layout_fluid_gliding(layout: &DtLayout) -> bool {
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_layout_fluid_glide(layout: &mut DtLayout, elapsed: f64) -> bool {
     layout.0.fluid.glide(elapsed)
+}
+
+pub struct DtMergeResult {
+    result: MergeResult,
+    error: Option<String>,
+}
+
+#[repr(C)]
+pub struct DtStr16 {
+    pub ptr: *const u16,
+    pub len: usize,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_merge_result_new(diff: &DtFileDiff) -> *mut DtMergeResult {
+    let result = match &diff.0 {
+        Diff::Merge(merge, _) => MergeResult::new(merge),
+        Diff::Files(_) => MergeResult::default(),
+    };
+    Box::into_raw(Box::new(DtMergeResult { result, error: None }))
+}
+
+/// # Safety
+/// `result` must come from `dt_merge_result_new` and not be used afterwards, or be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dt_merge_result_free(result: *mut DtMergeResult) {
+    if !result.is_null() {
+        drop(unsafe { Box::from_raw(result) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_merge_result_text(result: &DtMergeResult) -> DtStr16 {
+    let text = result.result.text();
+    DtStr16 { ptr: text.as_ptr(), len: text.len() }
+}
+
+/// # Safety
+/// `text` must point to `text_len` UTF-16 code units, or be null if there are none.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dt_merge_result_replace(
+    result: &mut DtMergeResult,
+    start: usize,
+    length: usize,
+    text: *const u16,
+    text_len: usize,
+) {
+    let text = if text.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(text, text_len) } };
+    result.result.replace(start, length, text);
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_merge_result_hunk_count(result: &DtMergeResult) -> usize {
+    result.result.hunk_count()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_merge_result_hunk_at(result: &DtMergeResult, position: usize) -> isize {
+    result.result.hunk_at(position).map_or(-1, |h| h as isize)
+}
+
+/// # Safety
+/// `start` and `length` must be valid to write to.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dt_merge_result_hunk_range(
+    result: &DtMergeResult,
+    hunk: usize,
+    start: *mut usize,
+    length: *mut usize,
+) -> bool {
+    match result.result.hunk_range(hunk) {
+        Some(range) => {
+            unsafe {
+                *start = range.start;
+                *length = range.len();
+            }
+            true
+        }
+        None => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_merge_result_version(result: &DtMergeResult, hunk: usize, version: u8) -> DtStr {
+    result.result.version(hunk, version as usize).map_or_else(DtStr::empty, DtStr::new)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_merge_result_unresolved(result: &DtMergeResult, hunk: usize) -> bool {
+    result.result.unresolved(hunk)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_merge_result_conflict_count(result: &DtMergeResult) -> usize {
+    result.result.conflict_count()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_merge_result_has_conflict_markers(result: &DtMergeResult) -> bool {
+    result.result.has_conflict_markers()
+}
+
+/// # Safety
+/// `path` must be a NUL-terminated string.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dt_merge_result_save(result: &mut DtMergeResult, path: *const c_char) -> bool {
+    let path = unsafe { path_from_c(path) };
+    result.error = result.result.save(&path).err();
+    result.error.is_none()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_merge_result_error(result: &DtMergeResult) -> DtStr {
+    error_str(&result.error)
 }
