@@ -139,7 +139,7 @@ int main(int argc, char **argv) {
 	/* Fluid scrolling. */
 	CHECK(fabs(dt_layout_fluid_top(layout, DT_SIDE_A, 0, 20)) < 1e-9 && fabs(dt_layout_fluid_top(layout, DT_SIDE_B, 0, 20)) < 1e-9);
 	CHECK(!dt_layout_fluid_gliding(layout));
-	double y = dt_layout_fluid_scroll(layout, DT_SIDE_B, 10, 5, 0, 20);
+	double y = dt_layout_fluid_scroll(layout, DT_SIDE_B, 10, DT_SCROLL_WHEEL, 5, 0, 20);
 	CHECK(y > 0);
 	CHECK(fabs(dt_layout_fluid_top(layout, DT_SIDE_B, y, 20) - 10) < 1e-9);
 	dt_layout_fluid_scrolled(layout, y, 20);

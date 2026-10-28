@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::ptr;
 
 use crate::diff::{FileDiff, LineKind, Options, Side, Span};
+use crate::fluid::Phase;
 use crate::layout::{self, Anchor, Layout, Table};
 use crate::merge::{self, ChunkKind, Merge};
 use crate::merge_result::MergeResult;
@@ -569,16 +570,31 @@ pub extern "C" fn dt_layout_fluid_top(layout: &DtLayout, side: u8, y: f64, heigh
     layout.0.fluid.top(side as usize, y, height)
 }
 
+pub const DT_SCROLL_WHEEL: u8 = 0;
+pub const DT_SCROLL_GESTURE: u8 = 1;
+pub const DT_SCROLL_MOMENTUM: u8 = 2;
+
 #[unsafe(no_mangle)]
 pub extern "C" fn dt_layout_fluid_scroll(
     layout: &mut DtLayout,
     side: u8,
     delta: f64,
+    phase: u8,
     pointer: f64,
     y: f64,
     height: f64,
 ) -> f64 {
-    layout.0.fluid.scroll(side as usize, delta, pointer, y, height)
+    let phase = match phase {
+        DT_SCROLL_GESTURE => Phase::Gesture,
+        DT_SCROLL_MOMENTUM => Phase::Momentum,
+        _ => Phase::Wheel,
+    };
+    layout.0.fluid.scroll(side as usize, delta, phase, pointer, y, height)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_layout_fluid_release(layout: &mut DtLayout) {
+    layout.0.fluid.release()
 }
 
 #[unsafe(no_mangle)]

@@ -61,11 +61,6 @@ typedef enum {
 - (BOOL) isOpaque { return YES; }
 - (BOOL) acceptsFirstResponder { return YES; }
 
-/* In Fluid mode, the pane scrolled over moves with the wheel, and the others keep up. */
-- (void) scrollWheel:(NSEvent*)event {
-	[_owner scrollWheel:event side:_side];
-}
-
 /* In Fluid mode, what's drawn depends on where the pane is scrolled to, so it can't be drawn ahead. */
 + (BOOL) isCompatibleWithResponsiveScrolling {
 	return NO;

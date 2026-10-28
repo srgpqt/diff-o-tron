@@ -23,6 +23,14 @@ const CORNER_LINES: f64 = 4.0;
 const GLIDE_TIME: f64 = 0.1;
 const MAX_GLIDE_SPEED: f64 = 4000.0;
 
+/// Scrolled past its start or end with a trackpad, the leader stretches on, less and less, as
+/// macOS's scroll views do: shown past it by (1 - 1 / (STRETCH x / view height + 1)) of the
+/// view's height for x scrolled past. Let go, it springs back at this rate, in seconds. Carried
+/// past by momentum, it springs back once stretched this far, as a part of the view's height.
+const STRETCH: f64 = 0.55;
+const SPRING_TIME: f64 = 0.16;
+const MAX_MOMENTUM_STRETCH: f64 = 0.06;
+
 /// How far the shared layout must move from where the leader scrolled it for it to have been
 /// scrolled some other way, allowing for the front end rounding it to pixels.
 const SCROLLED_TOLERANCE: f64 = 1.0;
@@ -120,12 +128,48 @@ impl Map {
     }
 }
 
+/// What's scrolling the side scrolled over, for how it stretches past its start and end.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum Phase {
+    /// A mouse's wheel, which stops at the start and end.
+    Wheel,
+    /// Fingers on a trackpad, which stretch past them.
+    Gesture,
+    /// Momentum carrying on after the fingers lift, which bounces off them.
+    Momentum,
+}
+
+/// How far a side's shown past its start or end, in a view `height` tall, for `stretch` scrolled
+/// past it: less and less, never past the view's height.
+fn stretched(stretch: f64, height: f64) -> f64 {
+    if height <= 0.0 {
+        return 0.0;
+    }
+    (1.0 - 1.0 / (stretch.abs() * STRETCH / height + 1.0)) * height * stretch.signum()
+}
+
+/// The inverse of `stretched`.
+fn unstretched(overscroll: f64, height: f64) -> f64 {
+    if height <= 0.0 {
+        return 0.0;
+    }
+    let shown = (overscroll.abs() / height).min(0.999);
+    height / STRETCH * (1.0 / (1.0 - shown) - 1.0) * overscroll.signum()
+}
+
 /// The side scrolled over, which the others line up with.
 #[derive(Debug)]
 struct Leader {
     side: usize,
-    /// Where it shows from in its own layout.
+    /// Where it shows from in its own layout, from its start to as far as it scrolls.
     top: f64,
+    /// How far past its start (negative) or end it's stretched, as shown.
+    overscroll: f64,
+    /// Whether it's springing back from being stretched.
+    springing: bool,
+    /// Whether momentum stops carrying it on, having bounced off its start or end, or been let
+    /// go stretched, until fingers on the trackpad take hold of it again.
+    bounced: bool,
     /// Where in the view the pointer was.
     pointer: f64,
     /// Where it last scrolled the shared layout to.
@@ -226,7 +270,7 @@ impl Fluid {
                 let fraction = if range > 0.0 { (y / range).clamp(0.0, 1.0) } else { 0.0 };
                 self.maps[side].side(y + fraction * height) - fraction * height
             }
-            Some(leader) if leader.side == side => leader.top,
+            Some(leader) if leader.side == side => leader.top + leader.overscroll,
             Some(leader) => {
                 // Line the side up with the leader at the pointer, but at the top of the view
                 // when the leader's close to its start, and the bottom when it's close to its
@@ -247,7 +291,7 @@ impl Fluid {
     /// Scroll down by `delta` for a wheel over a side, with the pointer `pointer` down the view.
     /// The side moves with the wheel, and the others line up with it. Returns where to scroll
     /// the shared layout to, from `y`, as for the scroller.
-    pub fn scroll(&mut self, side: usize, delta: f64, pointer: f64, y: f64, height: f64) -> f64 {
+    pub fn scroll(&mut self, side: usize, delta: f64, phase: Phase, pointer: f64, y: f64, height: f64) -> f64 {
         let shared_range = (self.shared_end - height).max(0.0);
         // A side too short to scroll scrolls the shared layout.
         if side >= self.maps.len() || self.range(side, height) <= 0.0 {
@@ -263,11 +307,50 @@ impl Fluid {
         let range = self.range(side, height);
         let map = &self.maps[side];
         let Some(leader) = self.leader.as_mut() else { return y };
-        leader.top = (leader.top + delta).clamp(0.0, range);
+        match phase {
+            // Fingers on the trackpad take hold of it again.
+            Phase::Gesture | Phase::Wheel => {
+                leader.springing = false;
+                leader.bounced = false;
+            }
+            // Momentum doesn't carry it on once it's bounced, or it would bounce again and again.
+            Phase::Momentum if leader.bounced => return leader.y,
+            Phase::Momentum => {}
+        }
+        let mut delta = delta;
+        if leader.overscroll != 0.0 {
+            // Stretched: scrolling stretches it further or back, and once back, scrolls it.
+            let stretch = unstretched(leader.overscroll, height) + delta;
+            if stretch * leader.overscroll > 0.0 {
+                leader.overscroll = stretched(stretch, height);
+                delta = 0.0;
+            } else {
+                leader.overscroll = 0.0;
+                delta = stretch;
+            }
+        }
+        let wanted = leader.top + delta;
+        leader.top = wanted.clamp(0.0, range);
+        if phase != Phase::Wheel && wanted != leader.top {
+            leader.overscroll = stretched(wanted - leader.top, height);
+        }
+        if phase == Phase::Momentum && leader.overscroll.abs() >= MAX_MOMENTUM_STRETCH * height {
+            leader.springing = true;
+            leader.bounced = true;
+        }
         // The shared layout, for the scroller, where it shows the leader from.
         let point = leader.pointer.clamp(0.0, height);
         leader.y = (map.shared(leader.top + point) - point).clamp(0.0, shared_range);
         leader.y
+    }
+
+    /// The fingers lifted from the trackpad, or momentum ran out: a side stretched past its
+    /// start or end springs back.
+    pub fn release(&mut self) {
+        if let Some(leader) = self.leader.as_mut().filter(|l| l.overscroll != 0.0) {
+            leader.springing = true;
+            leader.bounced = true;
+        }
     }
 
     /// The shared layout was scrolled to `y`, perhaps some other way than for the wheel, as by
@@ -282,7 +365,13 @@ impl Fluid {
     /// layout, gliding each from where it shows now.
     fn lead(&mut self, leader: Option<(usize, f64)>, y: f64, height: f64) {
         let tops: Vec<f64> = (0..self.glide.len()).map(|side| self.top(side, y, height)).collect();
-        self.leader = leader.map(|(side, pointer)| Leader { side, top: tops[side], pointer, y });
+        self.leader = leader.map(|(side, pointer)| {
+            // Shown past its start or end, as while gliding there, it's stretched.
+            let top = tops[side].clamp(0.0, self.range(side, height).max(0.0));
+            let overscroll = tops[side] - top;
+            let springing = overscroll != 0.0;
+            Leader { side, top, overscroll, springing, bounced: springing, pointer, y }
+        });
         for (side, top) in tops.into_iter().enumerate() {
             let gap = top - self.lined_up_top(side, y, height);
             self.glide[side] = if gap.abs() < 0.5 { 0.0 } else { gap };
@@ -295,16 +384,24 @@ impl Fluid {
         self.glide.fill(0.0);
     }
 
+    /// Whether the sides are gliding into line, or the leader's springing back.
     pub fn gliding(&self) -> bool {
-        self.glide.iter().any(|&gap| gap != 0.0)
+        self.glide.iter().any(|&gap| gap != 0.0) || self.leader.as_ref().is_some_and(|l| l.springing)
     }
 
-    /// Glide for `elapsed` seconds. Returns whether the sides are still gliding.
+    /// Glide, and spring back, for `elapsed` seconds. Returns whether still gliding.
     pub fn glide(&mut self, elapsed: f64) -> bool {
         for gap in &mut self.glide {
             // Closing the gap fast, then slowly, but not too fast.
             let step = (gap.abs() * (1.0 - (-elapsed / GLIDE_TIME).exp())).min(MAX_GLIDE_SPEED * elapsed);
             *gap = if gap.abs() - step < 0.5 { 0.0 } else { *gap - step.copysign(*gap) };
+        }
+        if let Some(leader) = self.leader.as_mut().filter(|l| l.springing) {
+            leader.overscroll *= (-elapsed / SPRING_TIME).exp();
+            if leader.overscroll.abs() < 0.5 {
+                leader.overscroll = 0.0;
+                leader.springing = false;
+            }
         }
         self.gliding()
     }
@@ -371,7 +468,7 @@ mod tests {
         let mut y = 0.0;
         let mut last = f.top(1, y, HEIGHT);
         for step in 1..=200 {
-            y = f.scroll(0, 10.0, HEIGHT / 2.0, y, HEIGHT);
+            y = f.scroll(0, 10.0, Phase::Wheel, HEIGHT / 2.0, y, HEIGHT);
             f.glide(1.0);
             let top = f.top(0, y, HEIGHT);
             let range = f.range(0, HEIGHT);
@@ -390,8 +487,8 @@ mod tests {
     #[test]
     fn sides_start_together() {
         let mut f = added_block();
-        let y = f.scroll(1, 2000.0, 100.0, 0.0, HEIGHT);
-        let y = f.scroll(1, -5000.0, 100.0, y, HEIGHT);
+        let y = f.scroll(1, 2000.0, Phase::Wheel, 100.0, 0.0, HEIGHT);
+        let y = f.scroll(1, -5000.0, Phase::Wheel, 100.0, y, HEIGHT);
         f.glide(1.0);
         assert_eq!((f.top(0, y, HEIGHT), f.top(1, y, HEIGHT)), (0.0, 0.0));
     }
@@ -399,7 +496,7 @@ mod tests {
     #[test]
     fn scrolling_some_other_way_lines_up_with_the_shared_layout_gliding() {
         let mut f = added_block();
-        let y = f.scroll(0, 600.0, 100.0, 0.0, HEIGHT);
+        let y = f.scroll(0, 600.0, Phase::Wheel, 100.0, 0.0, HEIGHT);
         let shown = f.top(1, y, HEIGHT);
         // Not scrolled any further: still led by side A.
         f.scrolled(y + 0.5, HEIGHT);
@@ -416,7 +513,7 @@ mod tests {
     #[test]
     fn lining_up_at_once() {
         let mut f = added_block();
-        let y = f.scroll(0, 600.0, 100.0, 0.0, HEIGHT);
+        let y = f.scroll(0, 600.0, Phase::Wheel, 100.0, 0.0, HEIGHT);
         f.lead(None, y, HEIGHT);
         assert!(f.gliding());
         f.line_up();
@@ -425,10 +522,74 @@ mod tests {
     }
 
     #[test]
+    fn stretching_past_the_start_with_a_trackpad_and_springing_back() {
+        let mut f = added_block();
+        // A wheel stops at the start.
+        f.scroll(0, -100.0, Phase::Wheel, 100.0, 0.0, HEIGHT);
+        assert_eq!(f.top(0, 0.0, HEIGHT), 0.0);
+        // Fingers stretch it on, less and less.
+        f.scroll(0, -100.0, Phase::Gesture, 100.0, 0.0, HEIGHT);
+        let first = f.top(0, 0.0, HEIGHT);
+        assert!(first < -40.0 && first > -100.0, "{first}");
+        f.scroll(0, -100.0, Phase::Gesture, 100.0, 0.0, HEIGHT);
+        let second = f.top(0, 0.0, HEIGHT);
+        assert!(first - second < -first, "{first} then {second}");
+        // The others stay at their start.
+        assert_eq!(f.top(1, 0.0, HEIGHT), 0.0);
+        // Scrolling back takes the stretch back first, then scrolls.
+        f.scroll(0, 100.0, Phase::Gesture, 100.0, 0.0, HEIGHT);
+        assert!((f.top(0, 0.0, HEIGHT) - first).abs() < 1e-6);
+        f.scroll(0, -100.0, Phase::Gesture, 100.0, 0.0, HEIGHT);
+        // Let go, it springs back, and momentum doesn't carry it on meanwhile.
+        f.release();
+        assert!(f.gliding());
+        f.scroll(0, -30.0, Phase::Momentum, 100.0, 0.0, HEIGHT);
+        assert!((f.top(0, 0.0, HEIGHT) - second).abs() < 1e-6);
+        while f.glide(1.0 / 60.0) {}
+        assert_eq!(f.top(0, 0.0, HEIGHT), 0.0);
+    }
+
+    #[test]
+    fn momentum_bounces_off_the_end() {
+        let mut f = added_block();
+        let range = f.range(0, HEIGHT);
+        let mut y = f.scroll(0, range - 10.0, Phase::Gesture, 100.0, 0.0, HEIGHT);
+        f.release();
+        assert!(!f.gliding());
+        // Momentum slowing down, but carrying on long after it bounced.
+        let mut most: f64 = 0.0;
+        let mut bounces = 0;
+        let mut stretched = false;
+        for step in 0..200 {
+            y = f.scroll(0, 30.0 * 0.98_f64.powi(step), Phase::Momentum, 100.0, y, HEIGHT);
+            most = most.max(f.top(0, y, HEIGHT) - range);
+            f.glide(1.0 / 60.0);
+            let past = f.top(0, y, HEIGHT) - range;
+            if past > 0.0 && !stretched {
+                bounces += 1;
+            }
+            stretched = past > 0.0;
+        }
+        assert!(most > 0.0 && most <= MAX_MOMENTUM_STRETCH * HEIGHT + 30.0, "{most}");
+        assert_eq!(bounces, 1);
+        f.release();
+        while f.glide(1.0 / 60.0) {}
+        assert_eq!(f.top(0, y, HEIGHT), range);
+        assert_eq!(f.top(1, y, HEIGHT), f.range(1, HEIGHT));
+    }
+
+    #[test]
+    fn stretching_is_undone_exactly() {
+        for stretch in [-500.0, -1.0, 3.0, 1000.0] {
+            assert!((unstretched(stretched(stretch, HEIGHT), HEIGHT) - stretch).abs() < 1e-6);
+        }
+    }
+
+    #[test]
     fn a_side_too_short_to_scroll_scrolls_the_shared_layout() {
         let hunks = [Hunk { rows: 0..100, lines: vec![0..10, 0..100] }];
         let mut f = Fluid::new(&hunks, &tops(100), &[&tops(10), &tops(100)], PADDING, LINE);
-        assert_eq!(f.scroll(0, 50.0, 0.0, 0.0, HEIGHT), 50.0);
+        assert_eq!(f.scroll(0, 50.0, Phase::Wheel, 0.0, 0.0, HEIGHT), 50.0);
         assert!(f.leader.is_none());
     }
 

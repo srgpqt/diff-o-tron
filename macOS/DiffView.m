@@ -5,6 +5,7 @@
 #import "DiffConnectorView.h"
 #import "DiffGutterView.h"
 #import "DiffPaneView.h"
+#import "DiffScrollView.h"
 
 #include <math.h>
 
@@ -107,7 +108,7 @@ static const NSTimeInterval kScrollToHunkDuration = 0.2;
 		/* Views for as many sides as a diff can have; those it doesn't are hidden. */
 		for (NSUInteger side = 0; side < kMaxSides; side++) {
 			DiffPaneView* pane = [[DiffPaneView alloc] initWithOwner:self side:side];
-			NSScrollView* scroll = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+			NSScrollView* scroll = [[DiffScrollView alloc] initWithOwner:self side:side];
 			scroll.hasHorizontalScroller = YES;
 			scroll.autohidesScrollers = YES;
 			scroll.backgroundColor = [NSColor textBackgroundColor];
@@ -491,23 +492,31 @@ static const NSTimeInterval kScrollToHunkDuration = 0.2;
 	return dt_layout_fluid_top(_layout, (uint8_t)side, y, NSHeight(_scrolls[side].contentView.bounds)) - y;
 }
 
+- (NSScrollView*) scrollViewOfSide:(NSUInteger)side {
+	return _scrolls[side];
+}
+
 /*
  * Scroll for a wheel over a side. In Fluid mode, the side's own layout moves with
- * the wheel, and the other sides keep up with it; otherwise every side scrolls the same.
+ * the wheel, and the other sides keep up with it; otherwise every side scrolls the
+ * same, as the scroll views do themselves.
  */
-- (void) scrollWheel:(NSEvent*)event side:(NSUInteger)side {
+- (BOOL) scrollWheel:(NSEvent*)event side:(NSUInteger)side {
 	NSScrollView* scroll = _scrolls[side];
-	if (_mode != kDiffModeFluid || !_diff || side >= _sideCount) {
-		[scroll scrollWheel:event];
-		return;
-	}
+	if (_mode != kDiffModeFluid || !_diff || side >= _sideCount) return NO;
+	/* A trackpad's fingers lifting, or its momentum running out, comes with no scrolling. */
+	NSEventPhase ending = NSEventPhaseEnded | NSEventPhaseCancelled;
+	BOOL released = (event.phase & ending) || (event.momentumPhase & ending);
 	CGFloat dx = event.scrollingDeltaX;
 	CGFloat dy = event.scrollingDeltaY;
 	if (!event.hasPreciseScrollingDeltas) {
 		dx *= _lineHeight;
 		dy *= _lineHeight;
 	}
-	if (fabs(dx) < 0.01 && fabs(dy) < 0.01) return;
+	if (fabs(dx) < 0.01 && fabs(dy) < 0.01) {
+		if (released) [self releaseScrolling];
+		return YES;
+	}
 
 	NSClipView* clip = scroll.contentView;
 	NSRect bounds = clip.bounds;
@@ -516,16 +525,29 @@ static const NSTimeInterval kScrollToHunkDuration = 0.2;
 	CGFloat y = NSMinY(bounds);
 	if (fabs(dy) >= 0.01) {
 		CGFloat pointer = [_panes[side] convertPoint:event.locationInWindow fromView:nil].y - NSMinY(bounds);
-		y = dt_layout_fluid_scroll(_layout, (uint8_t)side, -dy, pointer, y, NSHeight(bounds));
+		/* A trackpad stretches the side past its start and end, as scroll views do; a mouse's wheel doesn't. */
+		uint8_t phase = event.momentumPhase != NSEventPhaseNone ? DT_SCROLL_MOMENTUM
+			: event.phase != NSEventPhaseNone ? DT_SCROLL_GESTURE
+			: DT_SCROLL_WHEEL;
+		y = dt_layout_fluid_scroll(_layout, (uint8_t)side, -dy, phase, pointer, y, NSHeight(bounds));
 	}
 	_wheeling = YES;
 	[clip scrollToPoint:NSMakePoint(x, y)];
 	[scroll reflectScrolledClipView:clip];
 	_wheeling = NO;
+	if (released) dt_layout_fluid_release(_layout);
 	if (dt_layout_fluid_gliding(_layout)) [self startGliding];
 	[self redrawAll];
 	/* Show the scroller, as scrolling does. */
 	if (event.phase == NSEventPhaseBegan || !event.hasPreciseScrollingDeltas) [_scrolls[_sideCount - 1] flashScrollers];
+	return YES;
+}
+
+/* The trackpad let go: a side stretched past its start or end springs back. */
+- (void) releaseScrolling {
+	if (_mode != kDiffModeFluid) return;
+	dt_layout_fluid_release(_layout);
+	if (dt_layout_fluid_gliding(_layout)) [self startGliding];
 }
 
 - (BOOL) rowInCurrentHunk:(size_t)row {

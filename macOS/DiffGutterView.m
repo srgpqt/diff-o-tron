@@ -19,9 +19,9 @@
 - (BOOL) isFlipped { return YES; }
 - (BOOL) isOpaque { return YES; }
 
-/* Scrolling over the line numbers scrolls their side. */
+/* Scrolling over the line numbers scrolls their side, as its scroll view does. */
 - (void) scrollWheel:(NSEvent*)event {
-	[_owner scrollWheel:event side:_side];
+	[[_owner scrollViewOfSide:_side] scrollWheel:event];
 }
 
 - (void) drawRect:(NSRect)dirtyRect {

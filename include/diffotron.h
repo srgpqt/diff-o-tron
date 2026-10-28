@@ -310,11 +310,23 @@ bool dt_layout_scroll_to_hunk(const DtLayout *layout, uint8_t table, size_t hunk
  * layout scrolled down to y in a view height tall.
  */
 double dt_layout_fluid_top(const DtLayout *layout, uint8_t side, double y, double height);
+/* What's scrolling, for dt_layout_fluid_scroll. */
+enum {
+	DT_SCROLL_WHEEL = 0,    /* a mouse's wheel, which stops at the start and end */
+	DT_SCROLL_GESTURE = 1,  /* fingers on a trackpad, which stretch past them */
+	DT_SCROLL_MOMENTUM = 2, /* momentum after the fingers lift, which bounces off them */
+};
+
 /*
  * Scroll down by delta for a wheel over a side, with the pointer pointer down
- * the view. Returns where to scroll the shared layout to, from y.
+ * the view. Returns where to scroll the shared layout to, from y. With a
+ * trackpad, the side stretches past its start or end, until dt_layout_fluid_release
+ * lets it spring back, gliding.
  */
-double dt_layout_fluid_scroll(DtLayout *layout, uint8_t side, double delta, double pointer, double y, double height);
+double dt_layout_fluid_scroll(DtLayout *layout, uint8_t side, double delta, uint8_t phase, double pointer, double y,
+	double height);
+/* The fingers lifted from the trackpad, or momentum ran out: a side stretched past its start or end springs back. */
+void dt_layout_fluid_release(DtLayout *layout);
 /*
  * The shared layout was scrolled to y, as by the scroller: unless
  * dt_layout_fluid_scroll scrolled it there, the sides line up with it again.
