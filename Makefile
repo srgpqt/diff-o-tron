@@ -275,21 +275,37 @@ run-windows: windows
 
 # --- Linux -------------------------------------------------------------------
 
-# The pkg-config packages the Linux front end uses, such as gtk4.
-LINUX_PKGS ?=
+# The Linux front end: Linux/*.vala, in Vala with GTK 4, and Linux/diffotron.vapi binding the core.
+# Needs valac and GTK 4's development files (`brew install vala gtk4`, or Debian's valac and
+# libgtk-4-dev). The C valac makes builds with warnings off: they're Vala's, not ours.
+VALAC      ?= valac
+LINUX_PKGS ?= gtk4
 LINUX_CC   ?= clang
-LINUX_BIN  := $(BUILD)/$(APP_NAME)
-LINUX_PKG_CFLAGS := $(if $(LINUX_PKGS),$(shell pkg-config --cflags $(LINUX_PKGS)))
-LINUX_PKG_LIBS   := $(if $(LINUX_PKGS),$(shell pkg-config --libs $(LINUX_PKGS)))
+LINUX_BIN  := $(BUILD)/diff-o-tron
+LINUX_SRCS := $(wildcard Linux/*.vala)
+# Find the packages' libraries where they are, as when they're Homebrew's rather than the system's.
+LINUX_RPATH := $(foreach dir,$(sort $(patsubst -L%,%,$(shell pkg-config --libs-only-L $(LINUX_PKGS) 2>/dev/null))),$(if $(filter /usr/lib% /lib%,$(dir)),,-X -Wl,-rpath,$(dir)))
+LINUX_VALAFLAGS := \
+	--vapidir=Linux --pkg diffotron $(addprefix --pkg ,$(LINUX_PKGS)) --target-glib=auto \
+	--directory=$(BUILD)/Linux --basedir=Linux \
+	--cc=$(LINUX_CC) -X -Iinclude -X -w -X -DG_LOG_DOMAIN=\"Diff-o-tron\" \
+	-X -DAPP_VERSION=\"$(APP_VERSION)\" \
+	$(if $(filter release,$(CONFIG)),-X -O2 -X -DNDEBUG,-g)
 
-linux: $(LINUX_BIN)
+linux: $(LINUX_BIN) $(BUILD)/credits.html $(BUILD)/diff-o-tron.svg
 
-$(BUILD)/Linux/main.o: Linux/main.c
+$(LINUX_BIN): $(LINUX_SRCS) Linux/diffotron.vapi include/diffotron.h $(RUST_LIB)
 	@mkdir -p $(@D)
-	$(LINUX_CC) $(CFLAGS) $(LINUX_PKG_CFLAGS) -MMD -MP -c -o $@ $<
+	$(VALAC) $(LINUX_VALAFLAGS) -o $(abspath $@) $(LINUX_SRCS) -X $(abspath $(RUST_LIB)) $(addprefix -X ,$(RUST_LIBS_linux)) $(LINUX_RPATH)
 
-$(LINUX_BIN): $(BUILD)/Linux/main.o $(RUST_LIB)
-	$(LINUX_CC) -o $@ $^ $(LINUX_PKG_LIBS) $(RUST_LIBS_linux)
+# The About dialog's credits and logo, next to the binary.
+$(BUILD)/credits.html: Assets/credits.html
+	@mkdir -p $(@D)
+	cp $< $@
+
+$(BUILD)/diff-o-tron.svg: Assets/AppIcon.svg
+	@mkdir -p $(@D)
+	cp $< $@
 
 run-linux: linux
 	$(LINUX_BIN) $(ARGS)
