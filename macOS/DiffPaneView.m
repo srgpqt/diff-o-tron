@@ -20,6 +20,13 @@ static BOOL position_equal(TextPosition a, TextPosition b) {
 	return a.line == b.line && a.index == b.index;
 }
 
+/* What a click selects, which dragging or shift-clicking then extends the selection by, as in NSTextView. */
+typedef enum {
+	kSelectCharacters,
+	kSelectWords, /* for a double click */
+	kSelectLines, /* for a triple click */
+} SelectionGranularity;
+
 
 @implementation DiffPaneView {
 	__weak DiffView* _owner;
@@ -27,6 +34,14 @@ static BOOL position_equal(TextPosition a, TextPosition b) {
 	/* The selection, from _anchor where it started to _head, or none when _anchor.line < 0. */
 	TextPosition _anchor;
 	TextPosition _head;
+	/*
+	 * What stays selected as the selection's extended by _granularity, from
+	 * _unitStart to _unitEnd: what the click starting it selected, or after a
+	 * shift-click, the end the click left in place.
+	 */
+	TextPosition _unitStart;
+	TextPosition _unitEnd;
+	SelectionGranularity _granularity;
 	/* The file the context menu is for, or nil. */
 	NSURL* _menuFile;
 }
@@ -418,36 +433,84 @@ static BOOL position_equal(TextPosition a, TextPosition b) {
 		return;
 	}
 
+	/*
+	 * A double click selects a word, and a triple click a line; dragging from
+	 * either, or shift-clicking, selects whole words or lines. Shift-clicking
+	 * moves the end of the selection nearest the click to it, by what the
+	 * selection was made with when clicking once.
+	 */
+	SelectionGranularity granularity = event.clickCount >= 3 ? kSelectLines
+		: event.clickCount == 2 ? kSelectWords
+		: extend ? _granularity
+		: kSelectCharacters;
+	_granularity = granularity;
 	if (extend) {
-		[self selectFrom:_anchor to:position];
-	} else if (event.clickCount == 2) {
-		NSString* text = [self textOfLine:position.line];
-		NSRange word = NSMakeRange(position.index, 0);
-		if (text.length > 0) {
-			NSAttributedString* string = [[NSAttributedString alloc] initWithString:text];
-			word = [string doubleClickAtIndex:min_index(position.index, text.length - 1)];
-		}
-		TextPosition start = {position.line, word.location};
-		TextPosition end = {position.line, NSMaxRange(word)};
-		[self selectFrom:start to:end];
-	} else if (event.clickCount >= 3) {
-		/* The whole line, through its line break when there's a next line. */
-		TextPosition start = {position.line, 0};
-		TextPosition end = {position.line, [self textOfLine:position.line].length};
-		if ((size_t)position.line + 1 < [self lineCount]) {
-			end = (TextPosition){position.line + 1, 0};
-		}
-		[self selectFrom:start to:end];
+		TextPosition start, end;
+		[self selectionStart:&start end:&end];
+		BOOL moveStart = position_before(position, start)
+			|| (!position_before(end, position) && [self distanceFrom:start to:position] < [self distanceFrom:position to:end]);
+		/* The other end stays put, and the selection extends from it. */
+		_unitStart = moveStart ? end : start;
+		_unitEnd = _unitStart;
+		[self extendSelectionTo:position];
 	} else {
-		[self selectFrom:position to:position];
+		[self unitAt:position start:&_unitStart end:&_unitEnd];
+		[self selectFrom:_unitStart to:_unitEnd];
 	}
 
 	[self trackSelectionFrom:event];
 }
 
+/* What the selection's granularity selects at a position: the position itself, its word, or its line. */
+- (void) unitAt:(TextPosition)position start:(TextPosition*)start end:(TextPosition*)end {
+	NSString* text = [self textOfLine:position.line];
+	switch (_granularity) {
+		case kSelectCharacters:
+			*start = position;
+			*end = position;
+			break;
+		case kSelectWords: {
+			/* The word, or the run of spaces or punctuation, a double click selects. */
+			NSRange word = NSMakeRange(min_index(position.index, text.length), 0);
+			if (text.length > 0) {
+				NSAttributedString* string = [[NSAttributedString alloc] initWithString:text];
+				word = [string doubleClickAtIndex:min_index(position.index, text.length - 1)];
+			}
+			*start = (TextPosition){position.line, word.location};
+			*end = (TextPosition){position.line, NSMaxRange(word)};
+			break;
+		}
+		case kSelectLines:
+			/* The whole line, through its line break when there's a next line. */
+			*start = (TextPosition){position.line, 0};
+			*end = (TextPosition){position.line, text.length};
+			if ((size_t)position.line + 1 < [self lineCount]) *end = (TextPosition){position.line + 1, 0};
+			break;
+	}
+}
+
+/* How many characters there are from a position to one after it, counting each line break as one. */
+- (NSUInteger) distanceFrom:(TextPosition)from to:(TextPosition)to {
+	if (from.line == to.line) return to.index > from.index ? to.index - from.index : 0;
+	NSUInteger distance = [self textOfLine:from.line].length - min_index(from.index, [self textOfLine:from.line].length) + 1;
+	for (NSInteger line = from.line + 1; line < to.line; line++) distance += [self textOfLine:line].length + 1;
+	return distance + to.index;
+}
+
+/* Select from what the click starting the selection selected to the unit at a position, keeping both whole. */
+- (void) extendSelectionTo:(TextPosition)position {
+	TextPosition start, end;
+	[self unitAt:position start:&start end:&end];
+	BOOL backward = position_before(start, _unitStart);
+	TextPosition first = backward ? start : _unitStart;
+	TextPosition last = position_before(_unitEnd, end) ? end : _unitEnd;
+	[self selectFrom:backward ? last : first to:backward ? first : last];
+}
+
 /* Extend the selection until the mouse is released, scrolling while it's outside the view. */
 - (void) trackSelectionFrom:(NSEvent*)event {
 	NSEvent* drag = event;
+	TextPosition last = kNoPosition;
 	[NSEvent startPeriodicEventsAfterDelay:0.1 withPeriod:0.05];
 	for (;;) {
 		NSEvent* next = [self.window
@@ -458,7 +521,9 @@ static BOOL position_equal(TextPosition a, TextPosition b) {
 		[self autoscroll:drag];
 		NSPoint point = [self convertPoint:drag.locationInWindow fromView:nil];
 		TextPosition position = [self positionAtPoint:point];
-		if (position.line >= 0 && !position_equal(position, _head)) [self selectFrom:_anchor to:position];
+		if (position.line < 0 || position_equal(position, last)) continue;
+		last = position;
+		[self extendSelectionTo:position];
 	}
 	[NSEvent stopPeriodicEvents];
 }
@@ -476,6 +541,9 @@ static BOOL position_equal(TextPosition a, TextPosition b) {
 	NSInteger lastLine = (NSInteger)lines - 1;
 	TextPosition start = {0, 0};
 	TextPosition end = {lastLine, [self textOfLine:lastLine].length};
+	_granularity = kSelectCharacters;
+	_unitStart = start;
+	_unitEnd = start;
 	[self selectFrom:start to:end];
 }
 
