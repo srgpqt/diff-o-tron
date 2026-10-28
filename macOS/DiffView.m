@@ -192,7 +192,7 @@ typedef struct {
 		_gutters = gutters;
 		_connectors = connectors;
 		[self updateSideViews];
-		self.fontSize = 12;
+		self.fontSize = kDefaultFontSize;
 	}
 	return self;
 }

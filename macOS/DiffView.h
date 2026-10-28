@@ -10,6 +10,9 @@ enum {
 /* The width of the gap between sides. */
 static const CGFloat kMiddleWidth = 40;
 
+/* The size of a new DiffView's text, in points. */
+static const CGFloat kDefaultFontSize = 11;
+
 /*
  * Draws a file diff as side-by-side panes. A DiffView lays out, for each side,
  * a gutter of line numbers and a scroll view with that side's text, with

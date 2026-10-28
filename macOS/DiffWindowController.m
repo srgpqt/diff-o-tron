@@ -8,9 +8,13 @@
 #import "MergeEditor.h"
 #import "SidebarItem.h"
 
-/* User defaults: the DiffView mode new windows start in, and whether they wrap lines. */
+/* User defaults: the DiffView mode new windows start in, whether they wrap lines, and their text size. */
 static NSString* const kDiffModeDefault = @"DiffMode";
 static NSString* const kWrapLinesDefault = @"WrapLines";
+static NSString* const kTextSizeDefault = @"TextSize";
+/* The text sizes View › Increase and Decrease Text Size go between, in points. */
+static const CGFloat kMinTextSize = 8;
+static const CGFloat kMaxTextSize = 36;
 /* User defaults: the frame of the comparison window last moved or resized, where new ones open. */
 static NSString* const kWindowFrameDefault = @"WindowFrame";
 /* How far a new window is moved off a window already where it would open. */
@@ -208,6 +212,8 @@ static NSColor* status_color(uint8_t status) {
 	NSInteger mode = [defaults objectForKey:kDiffModeDefault] ? [defaults integerForKey:kDiffModeDefault] : kDiffModeFluid;
 	_diffView.mode = mode >= kDiffModeBlocks && mode <= kDiffModeUnified ? mode : kDiffModeFluid;
 	_diffView.wrapsLines = [defaults objectForKey:kWrapLinesDefault] ? [defaults boolForKey:kWrapLinesDefault] : YES;
+	CGFloat textSize = [defaults objectForKey:kTextSizeDefault] ? (CGFloat)[defaults doubleForKey:kTextSizeDefault] : kDefaultFontSize;
+	if (textSize >= kMinTextSize && textSize <= kMaxTextSize) _diffView.fontSize = textSize;
 
 	_message = [NSTextField wrappingLabelWithString:@""];
 	_message.alignment = NSTextAlignmentCenter;
@@ -1121,9 +1127,10 @@ static NSColor* status_color(uint8_t status) {
 }
 
 - (void) setTextSize:(CGFloat)size {
-	if (size < 8 || size > 36) return;
+	if (size < kMinTextSize || size > kMaxTextSize) return;
 	_diffView.fontSize = size;
 	[self updateMergeFont];
+	[[NSUserDefaults standardUserDefaults] setDouble:size forKey:kTextSizeDefault];
 }
 
 - (BOOL) validateMenuItem:(NSMenuItem*)menuItem {
@@ -1157,9 +1164,9 @@ static NSColor* status_color(uint8_t status) {
 	} else if (action == @selector(selectNextFile:)) {
 		return [self fileRowFrom:_table.selectedRow step:1] >= 0;
 	} else if (action == @selector(increaseTextSize:)) {
-		return _diffView.fontSize < 36;
+		return _diffView.fontSize < kMaxTextSize;
 	} else if (action == @selector(decreaseTextSize:)) {
-		return _diffView.fontSize > 8;
+		return _diffView.fontSize > kMinTextSize;
 	}
 	return YES;
 }
