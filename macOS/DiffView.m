@@ -130,12 +130,8 @@ typedef struct {
 	NSMutableData* _rowTops;
 	NSArray<NSMutableData*>* _lineTops;
 	NSMutableData* _unifiedTops;
-	/*
-	 * For Fluid mode, per side, pairs of CGFloats: positions in the shared layout,
-	 * the rows', and the same positions in the side's own. Between them, one maps
-	 * linearly to the other.
-	 */
-	NSArray<NSMutableData*>* _anchors;
+	/* Fluid mode's scrolling, for the layout. */
+	DtFluid* _fluid;
 	/* The width lines are wrapped to, or 0 when they aren't. */
 	CGFloat _wrapWidth;
 	BOOL _layingOut;
@@ -143,6 +139,12 @@ typedef struct {
 	/* How lit up the current hunk is, from 1 when it starts flashing down to 0. */
 	CGFloat _flash;
 	NSTimer* _flashTimer;
+
+	/* Set while scrolling for the wheel, so as not to take that as scrolling the shared layout. */
+	BOOL _wheeling;
+	/* While the sides glide into line in Fluid mode, gliding them a frame at a time. */
+	NSTimer* _glideTimer;
+	NSTimeInterval _glideTime;
 }
 
 + (void) initialize {
@@ -209,6 +211,8 @@ typedef struct {
 }
 
 - (void) dealloc {
+	[_glideTimer invalidate];
+	dt_fluid_free(_fluid);
 	dt_file_diff_free(_diff);
 }
 
@@ -491,6 +495,7 @@ static NSMutableData* new_tops(size_t count) {
 
 /* Lay out every line for the current mode's wrap width. */
 - (void) layoutLines {
+	[self stopGliding];
 	_wrapWidth = [self currentWrapWidth];
 	size_t rows = _diff ? dt_file_diff_row_count(_diff) : 0;
 	size_t unifiedRows = _diff ? dt_file_diff_unified_count(_diff) : 0;
@@ -527,33 +532,18 @@ static NSMutableData* new_tops(size_t count) {
 		unifiedValues[row + 1] = unifiedValues[row] + height;
 	}
 
-	/* Anchors at the start of each row between hunks, and of each hunk, then at the end. */
-	NSMutableArray<NSMutableData*>* anchors = [NSMutableArray array];
-	size_t hunkCount = _diff ? dt_file_diff_hunk_count(_diff) : 0;
-	for (NSUInteger side = 0; side < kMaxSides; side++) {
-		NSMutableData* pairs = [NSMutableData data];
-		size_t hunkIndex = 0;
-		for (size_t row = 0; row < rows;) {
-			CGFloat pair[2] = {[self rowY:row], 0};
-			if (hunkIndex < hunkCount && dt_file_diff_hunk(_diff, hunkIndex).row_start == row) {
-				DtHunk hunk = dt_file_diff_hunk(_diff, hunkIndex++);
-				uint32_t start, end;
-				[self hunk:hunk side:side start:&start end:&end];
-				pair[1] = [self lineY:start side:side];
-				row = hunk.row_end;
-			} else {
-				int32_t line = dt_file_diff_row_line(_diff, row, (uint8_t)side);
-				pair[1] = [self lineY:line < 0 ? 0 : (size_t)line side:side];
-				row++;
-			}
-			[pairs appendBytes:pair length:sizeof pair];
-		}
-		size_t lines = _diff ? dt_file_diff_line_count(_diff, (uint8_t)side) : 0;
-		CGFloat end[2] = {[self rowY:rows], [self lineY:lines side:side]};
-		[pairs appendBytes:end length:sizeof end];
-		[anchors addObject:pairs];
-	}
-	_anchors = anchors;
+	[self layoutFluid];
+}
+
+/* Fluid mode's scrolling, for the layout. */
+- (void) layoutFluid {
+	dt_fluid_free(_fluid);
+	_fluid = NULL;
+	if (!_diff) return;
+	/* CGFloat is a double. */
+	const double* lineTops[DT_MAX_SIDES];
+	for (NSUInteger side = 0; side < kMaxSides; side++) lineTops[side] = _lineTops[side].bytes;
+	_fluid = dt_fluid_new(_diff, _rowTops.bytes, lineTops, kTopPadding, _lineHeight);
 }
 
 - (CGFloat) rowY:(size_t)row {
@@ -606,50 +596,47 @@ static NSMutableData* new_tops(size_t count) {
 	*end = side < kMaxSides ? hunk.end[side] : 0;
 }
 
-/*
- * Map a position in the shared layout, the Blocks layout's rows, to a side's own
- * layout: one to one between hunks, and stretched or squeezed across each one.
- */
-- (CGFloat) sidePosition:(CGFloat)position side:(NSUInteger)side {
-	NSData* anchors = _anchors[side];
-	const CGFloat* values = anchors.bytes;
-	size_t count = anchors.length / (2 * sizeof(CGFloat));
-	if (count == 0) return position;
-
-	/* The last anchor at or before the position. */
-	size_t low = 0;
-	size_t high = count;
-	while (low < high) {
-		size_t middle = low + (high - low) / 2;
-		if (values[2 * middle] <= position) {
-			low = middle + 1;
-		} else {
-			high = middle;
-		}
-	}
-	if (low == 0) return position - values[0] + values[1];
-
-	size_t i = low - 1;
-	CGFloat t0 = values[2 * i];
-	CGFloat v0 = values[2 * i + 1];
-	if (i + 1 >= count) return v0 + (position - t0);
-	CGFloat t1 = values[2 * i + 2];
-	CGFloat v1 = values[2 * i + 3];
-	if (t1 <= t0) return v1;
-	return v0 + (position - t0) * (v1 - v0) / (t1 - t0);
+- (CGFloat) shift:(NSUInteger)side {
+	if (_mode != kDiffModeFluid || !_fluid) return 0;
+	CGFloat y = [self verticalOffset:side];
+	return dt_fluid_top(_fluid, (uint8_t)side, y, NSHeight(_scrolls[side].contentView.bounds)) - y;
 }
 
-- (CGFloat) shift:(NSUInteger)side {
-	if (_mode != kDiffModeFluid || !_diff) return 0;
-	NSRect visible = _scrolls[side].contentView.bounds;
-	/*
-	 * Line the sides up at a point that moves from the top of the view to the
-	 * bottom as it scrolls down, so that they start and end together.
-	 */
-	CGFloat range = NSHeight(_panes[side].frame) - NSHeight(visible);
-	CGFloat fraction = range > 0 ? fmin(fmax(NSMinY(visible) / range, 0), 1) : 0;
-	CGFloat anchor = NSMinY(visible) + fraction * NSHeight(visible);
-	return [self sidePosition:anchor side:side] - anchor;
+/*
+ * Scroll for a wheel over a side. In Fluid mode, the side's own layout moves with
+ * the wheel, and the other sides keep up with it; otherwise every side scrolls the same.
+ */
+- (void) scrollWheel:(NSEvent*)event side:(NSUInteger)side {
+	NSScrollView* scroll = _scrolls[side];
+	if (_mode != kDiffModeFluid || !_fluid || side >= _sideCount) {
+		[scroll scrollWheel:event];
+		return;
+	}
+	CGFloat dx = event.scrollingDeltaX;
+	CGFloat dy = event.scrollingDeltaY;
+	if (!event.hasPreciseScrollingDeltas) {
+		dx *= _lineHeight;
+		dy *= _lineHeight;
+	}
+	if (fabs(dx) < 0.01 && fabs(dy) < 0.01) return;
+
+	NSClipView* clip = scroll.contentView;
+	NSRect bounds = clip.bounds;
+	CGFloat maxX = fmax(NSWidth(_panes[side].frame) - NSWidth(bounds), 0);
+	CGFloat x = fmin(fmax(NSMinX(bounds) - dx, 0), maxX);
+	CGFloat y = NSMinY(bounds);
+	if (fabs(dy) >= 0.01) {
+		CGFloat pointer = [_panes[side] convertPoint:event.locationInWindow fromView:nil].y - NSMinY(bounds);
+		y = dt_fluid_scroll(_fluid, (uint8_t)side, -dy, pointer, y, NSHeight(bounds));
+	}
+	_wheeling = YES;
+	[clip scrollToPoint:NSMakePoint(x, y)];
+	[scroll reflectScrolledClipView:clip];
+	_wheeling = NO;
+	if (dt_fluid_gliding(_fluid)) [self startGliding];
+	[self redrawAll];
+	/* Show the scroller, as scrolling does. */
+	if (event.phase == NSEventPhaseBegan || !event.hasPreciseScrollingDeltas) [_scrolls[_sideCount - 1] flashScrollers];
 }
 
 - (BOOL) rowInCurrentHunk:(size_t)row {
@@ -716,6 +703,11 @@ static NSMutableData* new_tops(size_t count) {
 /* Scroll every side up and down with whichever one scrolled. */
 - (void) clipViewBoundsDidChange:(NSNotification*)notification {
 	NSClipView* source = notification.object;
+	/* Scrolled some other way than by the wheel, as by the scroller: the sides line up with the shared layout again. */
+	if (_fluid && _mode == kDiffModeFluid && !_wheeling) {
+		dt_fluid_scrolled(_fluid, source.bounds.origin.y, NSHeight(source.bounds));
+		if (dt_fluid_gliding(_fluid)) [self startGliding];
+	}
 	if (!_syncingScroll) {
 		_syncingScroll = YES;
 		CGFloat y = source.bounds.origin.y;
@@ -842,6 +834,39 @@ static NSMutableData* new_tops(size_t count) {
 	for (DiffPaneView* pane in _panes) {
 		if (pane != selected) [pane clearSelection];
 	}
+}
+
+/* Glide the sides into line, a frame at a time, until they are. */
+- (void) startGliding {
+	if (_glideTimer) return;
+	_glideTime = [NSProcessInfo processInfo].systemUptime;
+	__weak DiffView* weakSelf = self;
+	_glideTimer = [NSTimer timerWithTimeInterval:1.0 / 120 repeats:YES block:^(NSTimer* timer) {
+		DiffView* view = weakSelf;
+		if (view) {
+			[view glide];
+		} else {
+			[timer invalidate];
+		}
+	}];
+	/* Also while the scroller is dragged. */
+	[[NSRunLoop currentRunLoop] addTimer:_glideTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void) glide {
+	NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
+	double elapsed = now - _glideTime;
+	_glideTime = now;
+	if (!_fluid || !dt_fluid_glide(_fluid, elapsed)) [self stopGliding];
+	for (NSView* view in _panes) [view setNeedsDisplay:YES];
+	for (NSView* view in _gutters) [view setNeedsDisplay:YES];
+	for (NSView* view in _connectors) [view setNeedsDisplay:YES];
+}
+
+/* Stop gliding the sides, as when they're laid out anew, lined up. */
+- (void) stopGliding {
+	[_glideTimer invalidate];
+	_glideTimer = nil;
 }
 
 - (void) flashCurrentHunk {

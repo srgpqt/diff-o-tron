@@ -9,6 +9,7 @@
 #ifndef DIFFOTRON_H
 #define DIFFOTRON_H
 
+#include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
 
@@ -18,6 +19,7 @@ extern "C" {
 
 typedef struct DtComparison DtComparison;
 typedef struct DtFileDiff DtFileDiff;
+typedef struct DtFluid DtFluid;
 
 typedef struct {
 	const char *ptr;
@@ -195,6 +197,47 @@ DtHunk dt_file_diff_hunk(const DtFileDiff *diff, size_t index);
 size_t dt_merge_chunk_count(const DtFileDiff *diff);
 DtMergeChunk dt_merge_chunk(const DtFileDiff *diff, size_t index);
 DtStr dt_merge_chunk_text(const DtFileDiff *diff, size_t index, uint8_t version);
+
+/*
+ * Fluid mode's scrolling, where each side shows its own lines together, without
+ * the side-by-side rows' filler, and the sides scroll to keep lined up.
+ *
+ * Positions are in points down the document, as the front end lays it out: the
+ * shared layout is the side-by-side rows, which the views scroll by, and each
+ * side's own layout its lines. The side scrolled over with the wheel leads,
+ * moving with it, and the others line up with it, the same part of the way
+ * through each run of changes. Scrolled some other way, as with the scroller,
+ * the sides line up with the shared layout. When they line up anew, they glide
+ * into line: while dt_fluid_gliding, call dt_fluid_glide each frame.
+ *
+ * row_tops has where each of the diff's rows starts, then where the last ends;
+ * line_tops has, for each side, the same for its lines. padding is the space
+ * after the last row, and after each side's last line; line_height, a line's
+ * height without wrapping, sets how far runs of changes are widened into the
+ * lines around them so that no side has to jump past lines another has none of.
+ * Never returns NULL.
+ */
+DtFluid *dt_fluid_new(const DtFileDiff *diff, const double *row_tops, const double *const *line_tops,
+	double padding, double line_height);
+void dt_fluid_free(DtFluid *fluid);
+/*
+ * Where a side shows from in its own layout, gliding or not, with the shared
+ * layout scrolled down to y in a view height tall.
+ */
+double dt_fluid_top(const DtFluid *fluid, uint8_t side, double y, double height);
+/*
+ * Scroll down by delta for a wheel over a side, with the pointer pointer down
+ * the view. Returns where to scroll the shared layout to, from y.
+ */
+double dt_fluid_scroll(DtFluid *fluid, uint8_t side, double delta, double pointer, double y, double height);
+/*
+ * The shared layout was scrolled to y, as by the scroller: unless
+ * dt_fluid_scroll scrolled it there, the sides line up with it again.
+ */
+void dt_fluid_scrolled(DtFluid *fluid, double y, double height);
+bool dt_fluid_gliding(const DtFluid *fluid);
+/* Glide for elapsed seconds. Returns whether the sides are still gliding. */
+bool dt_fluid_glide(DtFluid *fluid, double elapsed);
 
 #ifdef __cplusplus
 }

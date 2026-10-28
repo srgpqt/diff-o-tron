@@ -19,6 +19,11 @@
 - (BOOL) isFlipped { return YES; }
 - (BOOL) isOpaque { return YES; }
 
+/* Scrolling over the line numbers scrolls their side. */
+- (void) scrollWheel:(NSEvent*)event {
+	[_owner scrollWheel:event side:_side];
+}
+
 - (void) drawRect:(NSRect)dirtyRect {
 	NSRect dirty = NSIntersectionRect(dirtyRect, self.bounds);
 	[[NSColor textBackgroundColor] setFill];

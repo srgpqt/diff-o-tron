@@ -7,6 +7,7 @@ use std::path::PathBuf;
 use std::ptr;
 
 use crate::diff::{FileDiff, LineKind, Options, Side, Span};
+use crate::fluid::{self, Fluid};
 use crate::merge::{self, ChunkKind, Merge};
 use crate::tree::{Comparison, Status};
 
@@ -405,4 +406,75 @@ pub extern "C" fn dt_merge_chunk_text(diff: &DtFileDiff, index: usize, version: 
         },
         Diff::Files(_) => DtStr::empty(),
     }
+}
+
+pub struct DtFluid(Fluid);
+
+/// # Safety
+/// `row_tops` must point to `dt_file_diff_row_count(diff) + 1` values, and `line_tops` to
+/// `dt_file_diff_side_count(diff)` pointers, each to `dt_file_diff_line_count(diff, side) + 1`
+/// values; or either may be null for none.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dt_fluid_new(
+    diff: &DtFileDiff,
+    row_tops: *const f64,
+    line_tops: *const *const f64,
+    padding: f64,
+    line_height: f64,
+) -> *mut DtFluid {
+    let sides = dt_file_diff_side_count(diff);
+    let slice = |ptr: *const f64, len: usize| -> &[f64] {
+        if ptr.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(ptr, len) } }
+    };
+    let rows = slice(row_tops, diff.0.row_count() + 1);
+    let lines: Vec<&[f64]> = (0..sides)
+        .map(|side| {
+            let ptr = if line_tops.is_null() { ptr::null() } else { unsafe { *line_tops.add(side) } };
+            slice(ptr, dt_file_diff_line_count(diff, side as u8) + 1)
+        })
+        .collect();
+    let hunks: Vec<fluid::Hunk> = (0..diff.0.hunk_count())
+        .map(|i| {
+            let h = diff.0.hunk(i);
+            fluid::Hunk {
+                rows: h.row_start as usize..h.row_end as usize,
+                lines: (0..sides).map(|s| h.start[s] as usize..h.end[s] as usize).collect(),
+            }
+        })
+        .collect();
+    Box::into_raw(Box::new(DtFluid(Fluid::new(&hunks, rows, &lines, padding, line_height))))
+}
+
+/// # Safety
+/// `fluid` must come from `dt_fluid_new` and not be used afterwards, or be null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dt_fluid_free(fluid: *mut DtFluid) {
+    if !fluid.is_null() {
+        drop(unsafe { Box::from_raw(fluid) });
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_fluid_top(fluid: &DtFluid, side: u8, y: f64, height: f64) -> f64 {
+    fluid.0.top(side as usize, y, height)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_fluid_scroll(fluid: &mut DtFluid, side: u8, delta: f64, pointer: f64, y: f64, height: f64) -> f64 {
+    fluid.0.scroll(side as usize, delta, pointer, y, height)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_fluid_scrolled(fluid: &mut DtFluid, y: f64, height: f64) {
+    fluid.0.scrolled(y, height)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_fluid_gliding(fluid: &DtFluid) -> bool {
+    fluid.0.gliding()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_fluid_glide(fluid: &mut DtFluid, elapsed: f64) -> bool {
+    fluid.0.glide(elapsed)
 }

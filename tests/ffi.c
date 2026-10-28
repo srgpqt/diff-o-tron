@@ -5,6 +5,7 @@
  * Usage: ffi <scratch directory>
  */
 
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -99,6 +100,28 @@ int main(int argc, char **argv) {
 	CHECK(dt_file_diff_unified_line(diff, 2, DT_SIDE_A) == -1 && dt_file_diff_unified_line(diff, 2, DT_SIDE_B) == 1);
 	CHECK(dt_file_diff_unified_line(diff, 3, DT_SIDE_A) == 2 && dt_file_diff_unified_line(diff, 3, DT_SIDE_B) == 2);
 	CHECK(dt_file_diff_unified_line(diff, 99, DT_SIDE_A) == -1);
+
+	/* Fluid scrolling, with lines 10 points tall after 4 of padding, in a view 20 points tall. */
+	double row_tops[64];
+	double side_tops[2][64];
+	size_t rows = dt_file_diff_row_count(diff);
+	CHECK(rows < 63);
+	for (size_t i = 0; i <= rows && i < 64; i++) row_tops[i] = 4 + 10 * (double)i;
+	for (uint8_t side = 0; side < 2; side++) {
+		for (size_t i = 0; i <= dt_file_diff_line_count(diff, side) && i < 64; i++) side_tops[side][i] = 4 + 10 * (double)i;
+	}
+	const double *line_tops[2] = {side_tops[0], side_tops[1]};
+	DtFluid *fluid = dt_fluid_new(diff, row_tops, line_tops, 4, 10);
+	CHECK(fabs(dt_fluid_top(fluid, DT_SIDE_A, 0, 20)) < 1e-9 && fabs(dt_fluid_top(fluid, DT_SIDE_B, 0, 20)) < 1e-9);
+	CHECK(!dt_fluid_gliding(fluid));
+	double y = dt_fluid_scroll(fluid, DT_SIDE_B, 10, 5, 0, 20);
+	CHECK(y > 0);
+	CHECK(fabs(dt_fluid_top(fluid, DT_SIDE_B, y, 20) - 10) < 1e-9);
+	dt_fluid_scrolled(fluid, y, 20);
+	CHECK(fabs(dt_fluid_top(fluid, DT_SIDE_B, y, 20) - 10) < 1e-9);
+	CHECK(!dt_fluid_glide(fluid, 1));
+	dt_fluid_free(fluid);
+	dt_fluid_free(NULL);
 
 	dt_file_diff_free(diff);
 	dt_comparison_free(cmp);

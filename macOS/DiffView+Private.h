@@ -82,6 +82,8 @@ static NSUInteger min_index(NSUInteger a, NSUInteger b) {
 	 * Blocks mode.
 	 */
 	- (CGFloat) shift:(NSUInteger)side;
+	/* Scroll for a wheel over a side's pane or gutter. */
+	- (void) scrollWheel:(NSEvent*)event side:(NSUInteger)side;
 	/* The lines a hunk covers on a side. */
 	- (void) hunk:(DtHunk)hunk side:(NSUInteger)side start:(uint32_t*)start end:(uint32_t*)end;
 	- (BOOL) rowInCurrentHunk:(size_t)row;
