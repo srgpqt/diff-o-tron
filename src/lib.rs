@@ -3,6 +3,7 @@
 pub mod diff;
 pub mod ffi;
 pub mod fluid;
+pub mod layout;
 pub mod merge;
 pub mod text;
 pub mod tree;

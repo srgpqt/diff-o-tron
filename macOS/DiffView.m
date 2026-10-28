@@ -61,63 +61,6 @@ NSColor* line_color(uint8_t kind, BOOL inCurrentHunk) {
 
 static const NSTimeInterval kFlashDuration = 0.4;
 
-/*
- * A layout of rows of varying heights, as CGFloats: where each row starts in
- * document coordinates, and after the last, where they end.
- */
-
-static size_t tops_count(NSData* tops) {
-	size_t entries = tops.length / sizeof(CGFloat);
-	return entries > 0 ? entries - 1 : 0;
-}
-
-/* Where a row starts, or for the row count, where the rows end. */
-static CGFloat tops_at(NSData* tops, size_t row) {
-	const CGFloat* values = tops.bytes;
-	size_t entries = tops.length / sizeof(CGFloat);
-	if (entries == 0) return kTopPadding;
-	return values[row < entries ? row : entries - 1];
-}
-
-/* The row at y: -1 above the first row, or the row count below the last. */
-static NSInteger tops_index(NSData* tops, CGFloat y) {
-	const CGFloat* values = tops.bytes;
-	size_t entries = tops.length / sizeof(CGFloat);
-	if (entries < 2 || y < values[0]) return -1;
-	/* The first entry after y. */
-	size_t low = 0;
-	size_t high = entries;
-	while (low < high) {
-		size_t middle = low + (high - low) / 2;
-		if (values[middle] <= y) {
-			low = middle + 1;
-		} else {
-			high = middle;
-		}
-	}
-	return (NSInteger)low - 1;
-}
-
-/* The rows from first up to last that overlap top to bottom. */
-static void tops_range(NSData* tops, CGFloat top, CGFloat bottom, size_t* first, size_t* last) {
-	size_t count = tops_count(tops);
-	NSInteger firstIndex = tops_index(tops, top);
-	NSInteger lastIndex = tops_index(tops, bottom);
-	*first = firstIndex < 0 ? 0 : (size_t)firstIndex;
-	*last = lastIndex < 0 ? 0 : min_index((size_t)lastIndex + 1, count);
-}
-
-/*
- * A place in the layout kept at the same place on the screen while it changes:
- * a fraction of the way down a row, screenY down from the top of the view.
- */
-typedef struct {
-	size_t row;
-	CGFloat fraction;
-	CGFloat screenY;
-	BOOL valid;
-} ScrollAnchor;
-
 @implementation DiffView {
 	NSArray<NSScrollView*>* _scrolls;
 	NSArray<DiffPaneView*>* _panes;
@@ -126,12 +69,8 @@ typedef struct {
 	size_t _maxLines;
 	BOOL _syncingScroll;
 
-	/* The layout: see tops_at. */
-	NSMutableData* _rowTops;
-	NSArray<NSMutableData*>* _lineTops;
-	NSMutableData* _unifiedTops;
-	/* Fluid mode's scrolling, for the layout. */
-	DtFluid* _fluid;
+	/* Where the lines and rows are, and Fluid mode's scrolling. Never NULL. */
+	DtLayout* _layout;
 	/* The width lines are wrapped to, or 0 when they aren't. */
 	CGFloat _wrapWidth;
 	BOOL _layingOut;
@@ -155,6 +94,7 @@ typedef struct {
 	if ((self = [super initWithFrame:frame])) {
 		clip_to_bounds(self);
 		_currentHunk = -1;
+		_layout = dt_layout_new(NULL, NULL, kTopPadding, 0);
 		NSMutableArray* scrolls = [NSMutableArray array];
 		NSMutableArray* panes = [NSMutableArray array];
 		NSMutableArray* gutters = [NSMutableArray array];
@@ -212,7 +152,7 @@ typedef struct {
 
 - (void) dealloc {
 	[_glideTimer invalidate];
-	dt_fluid_free(_fluid);
+	dt_layout_free(_layout);
 	dt_file_diff_free(_diff);
 }
 
@@ -265,7 +205,7 @@ typedef struct {
 
 - (void) setDiff:(DtFileDiff*)diff keepingPosition:(BOOL)keep {
 	if (diff == _diff) return;
-	ScrollAnchor anchor = keep ? [self scrollAnchor] : (ScrollAnchor){0, 0, 0, NO};
+	DtScrollAnchor anchor = keep ? [self scrollAnchor] : (DtScrollAnchor){0, 0, 0, false};
 	/* Where the current hunk starts, in the current mode's rows, to find the nearest hunk in the new diff. */
 	NSInteger hunkRow = -1;
 	if (keep && _diff && _currentHunk >= 0 && (size_t)_currentHunk < dt_file_diff_hunk_count(_diff)) {
@@ -377,56 +317,26 @@ typedef struct {
 
 /* Lay out the lines again, keeping what's in view where it is. */
 - (void) relayoutLines {
-	ScrollAnchor anchor = [self scrollAnchor];
+	DtScrollAnchor anchor = [self scrollAnchor];
 	[self layoutLines];
 	for (DiffPaneView* pane in _panes) [pane relayout];
 	[self restoreScrollAnchor:anchor];
 	[self redrawAll];
 }
 
-/* Where the current mode's row starts in the shared layout. */
-- (CGFloat) layoutY:(size_t)row {
-	return _mode == kDiffModeUnified ? [self unifiedY:row] : [self rowY:row];
-}
-
 /*
  * What to keep in place on the screen while the layout changes: the current
  * hunk if it's in view, or else the point in the middle of the view.
  */
-- (ScrollAnchor) scrollAnchor {
-	ScrollAnchor anchor = {0, 0, 0, NO};
-	if (!_diff) return anchor;
-	BOOL unified = _mode == kDiffModeUnified;
+- (DtScrollAnchor) scrollAnchor {
 	NSRect visible = _scrolls[0].contentView.bounds;
-
-	if (_currentHunk >= 0 && (size_t)_currentHunk < dt_file_diff_hunk_count(_diff)) {
-		DtHunk hunk = dt_file_diff_hunk(_diff, (size_t)_currentHunk);
-		size_t start = unified ? hunk.unified_start : hunk.row_start;
-		size_t end = unified ? hunk.unified_end : hunk.row_end;
-		CGFloat top = [self layoutY:start];
-		if ([self layoutY:end] > NSMinY(visible) && top < NSMaxY(visible)) {
-			return (ScrollAnchor){start, 0, top - NSMinY(visible), YES};
-		}
-	}
-
-	size_t count = unified ? dt_file_diff_unified_count(_diff) : dt_file_diff_row_count(_diff);
-	if (count == 0) return anchor;
-	CGFloat y = NSMidY(visible);
-	NSInteger row = unified ? [self unifiedRowAtY:y] : [self rowAtY:y];
-	size_t index = row < 0 ? 0 : min_index((size_t)row, count - 1);
-	CGFloat top = [self layoutY:index];
-	CGFloat height = [self layoutY:index + 1] - top;
-	CGFloat fraction = height > 0 ? fmin(fmax((y - top) / height, 0), 1) : 0;
-	return (ScrollAnchor){index, fraction, y - NSMinY(visible), YES};
+	return dt_layout_anchor(_layout, [self modeTable], _currentHunk, NSMinY(visible), NSHeight(visible));
 }
 
-- (void) restoreScrollAnchor:(ScrollAnchor)anchor {
+- (void) restoreScrollAnchor:(DtScrollAnchor)anchor {
 	if (!anchor.valid) return;
-	CGFloat top = [self layoutY:anchor.row];
-	CGFloat height = [self layoutY:anchor.row + 1] - top;
-	CGFloat y = top + anchor.fraction * height - anchor.screenY;
 	DiffPaneView* pane = _panes[0];
-	[pane scrollPoint:NSMakePoint(NSMinX(pane.visibleRect), fmax(0, y))];
+	[pane scrollPoint:NSMakePoint(NSMinX(pane.visibleRect), dt_layout_anchor_top(_layout, [self modeTable], anchor))];
 }
 
 - (void) paneDidResize:(DiffPaneView*)pane {
@@ -487,104 +397,74 @@ typedef struct {
 	return (CGFloat)(count > 0 ? count : 1) * _lineHeight;
 }
 
-static NSMutableData* new_tops(size_t count) {
-	NSMutableData* tops = [NSMutableData dataWithLength:(count + 1) * sizeof(CGFloat)];
-	((CGFloat*)tops.mutableBytes)[0] = kTopPadding;
-	return tops;
-}
-
 /* Lay out every line for the current mode's wrap width. */
 - (void) layoutLines {
 	[self stopGliding];
 	_wrapWidth = [self currentWrapWidth];
-	size_t rows = _diff ? dt_file_diff_row_count(_diff) : 0;
-	size_t unifiedRows = _diff ? dt_file_diff_unified_count(_diff) : 0;
-
-	/* Laid out for every side views can show, those the diff hasn't empty. */
-	NSMutableArray<NSMutableData*>* lineTops = [NSMutableArray array];
+	/* How tall each line is, for every side views can show: those the diff hasn't, none. */
+	size_t counts[DT_MAX_SIDES];
+	size_t total = 0;
 	for (NSUInteger side = 0; side < kMaxSides; side++) {
-		size_t count = _diff ? dt_file_diff_line_count(_diff, (uint8_t)side) : 0;
-		NSMutableData* tops = new_tops(count);
-		CGFloat* values = tops.mutableBytes;
-		for (size_t i = 0; i < count; i++) values[i + 1] = values[i] + [self heightOfLine:i side:side];
-		[lineTops addObject:tops];
+		counts[side] = _diff ? dt_file_diff_line_count(_diff, (uint8_t)side) : 0;
+		total += counts[side];
 	}
-	_lineTops = lineTops;
-
-	_rowTops = new_tops(rows);
-	CGFloat* rowValues = _rowTops.mutableBytes;
-	for (size_t row = 0; row < rows; row++) {
-		CGFloat height = 0;
-		for (NSUInteger side = 0; side < _sideCount; side++) {
-			int32_t line = dt_file_diff_row_line(_diff, row, (uint8_t)side);
-			if (line >= 0) height = fmax(height, [self lineY:(size_t)line + 1 side:side] - [self lineY:(size_t)line side:side]);
-		}
-		rowValues[row + 1] = rowValues[row] + height;
+	double* heights = malloc((total > 0 ? total : 1) * sizeof(double));
+	if (!heights) abort();
+	const double* lineHeights[DT_MAX_SIDES];
+	double* next = heights;
+	for (NSUInteger side = 0; side < kMaxSides; side++) {
+		for (size_t i = 0; i < counts[side]; i++) next[i] = [self heightOfLine:i side:side];
+		lineHeights[side] = next;
+		next += counts[side];
 	}
-
-	_unifiedTops = new_tops(unifiedRows);
-	CGFloat* unifiedValues = _unifiedTops.mutableBytes;
-	for (size_t row = 0; row < unifiedRows; row++) {
-		NSUInteger side = 0;
-		size_t line = 0;
-		CGFloat height = _lineHeight;
-		if ([self unifiedRow:row side:&side line:&line]) height = [self lineY:line + 1 side:side] - [self lineY:line side:side];
-		unifiedValues[row + 1] = unifiedValues[row] + height;
-	}
-
-	[self layoutFluid];
-}
-
-/* Fluid mode's scrolling, for the layout. */
-- (void) layoutFluid {
-	dt_fluid_free(_fluid);
-	_fluid = NULL;
-	if (!_diff) return;
-	/* CGFloat is a double. */
-	const double* lineTops[DT_MAX_SIDES];
-	for (NSUInteger side = 0; side < kMaxSides; side++) lineTops[side] = _lineTops[side].bytes;
-	_fluid = dt_fluid_new(_diff, _rowTops.bytes, lineTops, kTopPadding, _lineHeight);
+	dt_layout_free(_layout);
+	_layout = dt_layout_new(_diff, lineHeights, kTopPadding, _lineHeight);
+	free(heights);
 }
 
 - (CGFloat) rowY:(size_t)row {
-	return tops_at(_rowTops, row);
+	return dt_layout_y(_layout, DT_TABLE_ROWS, row);
 }
 
 - (CGFloat) lineY:(size_t)line side:(NSUInteger)side {
-	return tops_at(_lineTops[side], line);
+	return dt_layout_y(_layout, (uint8_t)side, line);
 }
 
 - (CGFloat) unifiedY:(size_t)row {
-	return tops_at(_unifiedTops, row);
+	return dt_layout_y(_layout, DT_TABLE_UNIFIED, row);
 }
 
 - (NSInteger) rowAtY:(CGFloat)y {
-	return tops_index(_rowTops, y);
+	return dt_layout_index_at(_layout, DT_TABLE_ROWS, y);
 }
 
 - (NSInteger) lineAtY:(CGFloat)y side:(NSUInteger)side {
-	return tops_index(_lineTops[side], y);
+	return dt_layout_index_at(_layout, (uint8_t)side, y);
 }
 
 - (NSInteger) unifiedRowAtY:(CGFloat)y {
-	return tops_index(_unifiedTops, y);
+	return dt_layout_index_at(_layout, DT_TABLE_UNIFIED, y);
 }
 
 - (void) rowsFrom:(CGFloat)top to:(CGFloat)bottom first:(size_t*)first last:(size_t*)last {
-	tops_range(_rowTops, top, bottom, first, last);
+	dt_layout_range(_layout, DT_TABLE_ROWS, top, bottom, first, last);
 }
 
 - (void) linesFrom:(CGFloat)top to:(CGFloat)bottom side:(NSUInteger)side first:(size_t*)first last:(size_t*)last {
-	tops_range(_lineTops[side], top, bottom, first, last);
+	dt_layout_range(_layout, (uint8_t)side, top, bottom, first, last);
 }
 
 - (void) unifiedRowsFrom:(CGFloat)top to:(CGFloat)bottom first:(size_t*)first last:(size_t*)last {
-	tops_range(_unifiedTops, top, bottom, first, last);
+	dt_layout_range(_layout, DT_TABLE_UNIFIED, top, bottom, first, last);
+}
+
+/* The layout's table of the current mode's rows. */
+- (uint8_t) modeTable {
+	return _mode == kDiffModeUnified ? DT_TABLE_UNIFIED : DT_TABLE_ROWS;
 }
 
 - (CGFloat) contentBottom {
-	NSData* tops = _mode == kDiffModeUnified ? _unifiedTops : _rowTops;
-	return tops_at(tops, tops_count(tops)) + kTopPadding;
+	return dt_layout_bottom(_layout, [self modeTable]);
 }
 
 - (CGFloat) verticalOffset:(NSUInteger)side {
@@ -597,9 +477,9 @@ static NSMutableData* new_tops(size_t count) {
 }
 
 - (CGFloat) shift:(NSUInteger)side {
-	if (_mode != kDiffModeFluid || !_fluid) return 0;
+	if (_mode != kDiffModeFluid || !_diff) return 0;
 	CGFloat y = [self verticalOffset:side];
-	return dt_fluid_top(_fluid, (uint8_t)side, y, NSHeight(_scrolls[side].contentView.bounds)) - y;
+	return dt_layout_fluid_top(_layout, (uint8_t)side, y, NSHeight(_scrolls[side].contentView.bounds)) - y;
 }
 
 /*
@@ -608,7 +488,7 @@ static NSMutableData* new_tops(size_t count) {
  */
 - (void) scrollWheel:(NSEvent*)event side:(NSUInteger)side {
 	NSScrollView* scroll = _scrolls[side];
-	if (_mode != kDiffModeFluid || !_fluid || side >= _sideCount) {
+	if (_mode != kDiffModeFluid || !_diff || side >= _sideCount) {
 		[scroll scrollWheel:event];
 		return;
 	}
@@ -627,13 +507,13 @@ static NSMutableData* new_tops(size_t count) {
 	CGFloat y = NSMinY(bounds);
 	if (fabs(dy) >= 0.01) {
 		CGFloat pointer = [_panes[side] convertPoint:event.locationInWindow fromView:nil].y - NSMinY(bounds);
-		y = dt_fluid_scroll(_fluid, (uint8_t)side, -dy, pointer, y, NSHeight(bounds));
+		y = dt_layout_fluid_scroll(_layout, (uint8_t)side, -dy, pointer, y, NSHeight(bounds));
 	}
 	_wheeling = YES;
 	[clip scrollToPoint:NSMakePoint(x, y)];
 	[scroll reflectScrolledClipView:clip];
 	_wheeling = NO;
-	if (dt_fluid_gliding(_fluid)) [self startGliding];
+	if (dt_layout_fluid_gliding(_layout)) [self startGliding];
 	[self redrawAll];
 	/* Show the scroller, as scrolling does. */
 	if (event.phase == NSEventPhaseBegan || !event.hasPreciseScrollingDeltas) [_scrolls[_sideCount - 1] flashScrollers];
@@ -704,9 +584,9 @@ static NSMutableData* new_tops(size_t count) {
 - (void) clipViewBoundsDidChange:(NSNotification*)notification {
 	NSClipView* source = notification.object;
 	/* Scrolled some other way than by the wheel, as by the scroller: the sides line up with the shared layout again. */
-	if (_fluid && _mode == kDiffModeFluid && !_wheeling) {
-		dt_fluid_scrolled(_fluid, source.bounds.origin.y, NSHeight(source.bounds));
-		if (dt_fluid_gliding(_fluid)) [self startGliding];
+	if (_mode == kDiffModeFluid && !_wheeling) {
+		dt_layout_fluid_scrolled(_layout, source.bounds.origin.y, NSHeight(source.bounds));
+		if (dt_layout_fluid_gliding(_layout)) [self startGliding];
 	}
 	if (!_syncingScroll) {
 		_syncingScroll = YES;
@@ -788,40 +668,22 @@ static NSMutableData* new_tops(size_t count) {
 }
 
 - (void) selectHunkAtUnifiedRow:(size_t)row {
-	size_t count = _diff ? dt_file_diff_hunk_count(_diff) : 0;
-	for (size_t i = 0; i < count; i++) {
-		DtHunk hunk = dt_file_diff_hunk(_diff, i);
-		if (row >= hunk.unified_start && row < hunk.unified_end) {
-			self.currentHunk = (NSInteger)i;
-			if (_currentHunkChanged) _currentHunkChanged();
-			return;
-		}
-	}
+	[self selectHunk:dt_layout_hunk_at(_layout, DT_TABLE_UNIFIED, row)];
 }
 
 - (void) selectHunkAtRow:(size_t)row {
-	size_t count = _diff ? dt_file_diff_hunk_count(_diff) : 0;
-	for (size_t i = 0; i < count; i++) {
-		DtHunk hunk = dt_file_diff_hunk(_diff, i);
-		if (row >= hunk.row_start && row < hunk.row_end) {
-			self.currentHunk = (NSInteger)i;
-			if (_currentHunkChanged) _currentHunkChanged();
-			return;
-		}
-	}
+	[self selectHunk:dt_layout_hunk_at(_layout, DT_TABLE_ROWS, row)];
 }
 
 - (void) selectHunkAtLine:(size_t)line side:(NSUInteger)side {
-	size_t count = _diff ? dt_file_diff_hunk_count(_diff) : 0;
-	for (size_t i = 0; i < count; i++) {
-		uint32_t start, end;
-		[self hunk:dt_file_diff_hunk(_diff, i) side:side start:&start end:&end];
-		if (line >= start && line < end) {
-			self.currentHunk = (NSInteger)i;
-			if (_currentHunkChanged) _currentHunkChanged();
-			return;
-		}
-	}
+	[self selectHunk:dt_layout_hunk_at(_layout, (uint8_t)side, line)];
+}
+
+/* Make a hunk clicked current, if it's one. */
+- (void) selectHunk:(NSInteger)hunk {
+	if (hunk < 0) return;
+	self.currentHunk = hunk;
+	if (_currentHunkChanged) _currentHunkChanged();
 }
 
 - (NSURL*) fileURLForSide:(NSUInteger)side {
@@ -857,7 +719,7 @@ static NSMutableData* new_tops(size_t count) {
 	NSTimeInterval now = [NSProcessInfo processInfo].systemUptime;
 	double elapsed = now - _glideTime;
 	_glideTime = now;
-	if (!_fluid || !dt_fluid_glide(_fluid, elapsed)) [self stopGliding];
+	if (!dt_layout_fluid_glide(_layout, elapsed)) [self stopGliding];
 	for (NSView* view in _panes) [view setNeedsDisplay:YES];
 	for (NSView* view in _gutters) [view setNeedsDisplay:YES];
 	for (NSView* view in _connectors) [view setNeedsDisplay:YES];
@@ -924,16 +786,13 @@ static NSMutableData* new_tops(size_t count) {
 
 /* Scroll the current hunk to a third of the way down, unless it's already in view. */
 - (void) scrollToCurrentHunk {
-	if (!_diff || _currentHunk < 0 || (size_t)_currentHunk >= dt_file_diff_hunk_count(_diff)) return;
-	DtHunk hunk = dt_file_diff_hunk(_diff, (size_t)_currentHunk);
-	BOOL unified = _mode == kDiffModeUnified;
-	CGFloat top = unified ? [self unifiedY:hunk.unified_start] : [self rowY:hunk.row_start];
-	CGFloat bottom = unified ? [self unifiedY:hunk.unified_end] : [self rowY:hunk.row_end];
+	if (_currentHunk < 0) return;
 	DiffPaneView* pane = _panes[0];
 	NSRect visible = pane.visibleRect;
-	if (top >= NSMinY(visible) && bottom <= NSMaxY(visible)) return;
-	CGFloat y = fmax(0, top - floor(NSHeight(visible) / 3));
-	[pane scrollPoint:NSMakePoint(NSMinX(visible), y)];
+	double y = 0;
+	if (dt_layout_scroll_to_hunk(_layout, [self modeTable], (size_t)_currentHunk, NSMinY(visible), NSHeight(visible), &y)) {
+		[pane scrollPoint:NSMakePoint(NSMinX(visible), y)];
+	}
 }
 
 @end

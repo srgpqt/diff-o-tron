@@ -101,27 +101,47 @@ int main(int argc, char **argv) {
 	CHECK(dt_file_diff_unified_line(diff, 3, DT_SIDE_A) == 2 && dt_file_diff_unified_line(diff, 3, DT_SIDE_B) == 2);
 	CHECK(dt_file_diff_unified_line(diff, 99, DT_SIDE_A) == -1);
 
-	/* Fluid scrolling, with lines 10 points tall after 4 of padding, in a view 20 points tall. */
-	double row_tops[64];
-	double side_tops[2][64];
-	size_t rows = dt_file_diff_row_count(diff);
-	CHECK(rows < 63);
-	for (size_t i = 0; i <= rows && i < 64; i++) row_tops[i] = 4 + 10 * (double)i;
+	/* The layout, with lines 10 points tall after 4 of padding, in a view 20 points tall. */
+	double heights[2][64];
 	for (uint8_t side = 0; side < 2; side++) {
-		for (size_t i = 0; i <= dt_file_diff_line_count(diff, side) && i < 64; i++) side_tops[side][i] = 4 + 10 * (double)i;
+		for (size_t i = 0; i < dt_file_diff_line_count(diff, side) && i < 64; i++) heights[side][i] = 10;
 	}
-	const double *line_tops[2] = {side_tops[0], side_tops[1]};
-	DtFluid *fluid = dt_fluid_new(diff, row_tops, line_tops, 4, 10);
-	CHECK(fabs(dt_fluid_top(fluid, DT_SIDE_A, 0, 20)) < 1e-9 && fabs(dt_fluid_top(fluid, DT_SIDE_B, 0, 20)) < 1e-9);
-	CHECK(!dt_fluid_gliding(fluid));
-	double y = dt_fluid_scroll(fluid, DT_SIDE_B, 10, 5, 0, 20);
+	const double *line_heights[2] = {heights[0], heights[1]};
+	DtLayout *layout = dt_layout_new(diff, line_heights, 4, 10);
+	size_t rows = dt_file_diff_row_count(diff);
+	CHECK(fabs(dt_layout_y(layout, DT_TABLE_ROWS, 1) - 14) < 1e-9);
+	CHECK(fabs(dt_layout_y(layout, DT_SIDE_B, 2) - 24) < 1e-9);
+	CHECK(fabs(dt_layout_bottom(layout, DT_TABLE_ROWS) - (8 + 10 * (double)rows)) < 1e-9);
+	CHECK(dt_layout_index_at(layout, DT_TABLE_ROWS, 0) == -1 && dt_layout_index_at(layout, DT_TABLE_ROWS, 15) == 1);
+	size_t first = 0, last = 0;
+	dt_layout_range(layout, DT_TABLE_ROWS, 15, 25, &first, &last);
+	CHECK(first == 1 && last == 3);
+	CHECK(dt_layout_hunk_at(layout, DT_TABLE_ROWS, hunk.row_start) == 1);
+	CHECK(dt_layout_hunk_at(layout, DT_TABLE_ROWS, 0) == -1);
+	/* Hunk 1, at 34, is out of view: the middle of the view instead, 60% down row 0. */
+	DtScrollAnchor anchor = dt_layout_anchor(layout, DT_TABLE_ROWS, 1, 0, 20);
+	CHECK(anchor.valid && anchor.index == 0);
+	CHECK(fabs(dt_layout_anchor_top(layout, DT_TABLE_ROWS, anchor)) < 1e-9);
+	double to = 0;
+	CHECK(dt_layout_scroll_to_hunk(layout, DT_TABLE_ROWS, 1, 0, 20, &to) && fabs(to - 28) < 1e-9);
+	CHECK(!dt_layout_scroll_to_hunk(layout, DT_TABLE_ROWS, 1, 30, 20, &to));
+
+	/* Fluid scrolling. */
+	CHECK(fabs(dt_layout_fluid_top(layout, DT_SIDE_A, 0, 20)) < 1e-9 && fabs(dt_layout_fluid_top(layout, DT_SIDE_B, 0, 20)) < 1e-9);
+	CHECK(!dt_layout_fluid_gliding(layout));
+	double y = dt_layout_fluid_scroll(layout, DT_SIDE_B, 10, 5, 0, 20);
 	CHECK(y > 0);
-	CHECK(fabs(dt_fluid_top(fluid, DT_SIDE_B, y, 20) - 10) < 1e-9);
-	dt_fluid_scrolled(fluid, y, 20);
-	CHECK(fabs(dt_fluid_top(fluid, DT_SIDE_B, y, 20) - 10) < 1e-9);
-	CHECK(!dt_fluid_glide(fluid, 1));
-	dt_fluid_free(fluid);
-	dt_fluid_free(NULL);
+	CHECK(fabs(dt_layout_fluid_top(layout, DT_SIDE_B, y, 20) - 10) < 1e-9);
+	dt_layout_fluid_scrolled(layout, y, 20);
+	CHECK(fabs(dt_layout_fluid_top(layout, DT_SIDE_B, y, 20) - 10) < 1e-9);
+	CHECK(!dt_layout_fluid_glide(layout, 1));
+	dt_layout_free(layout);
+	dt_layout_free(NULL);
+
+	DtLayout *empty = dt_layout_new(NULL, NULL, 4, 10);
+	CHECK(fabs(dt_layout_y(empty, DT_TABLE_ROWS, 3) - 4) < 1e-9);
+	CHECK(!dt_layout_anchor(empty, DT_TABLE_ROWS, -1, 0, 20).valid);
+	dt_layout_free(empty);
 
 	dt_file_diff_free(diff);
 	dt_comparison_free(cmp);

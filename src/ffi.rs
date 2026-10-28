@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use std::ptr;
 
 use crate::diff::{FileDiff, LineKind, Options, Side, Span};
-use crate::fluid::{self, Fluid};
+use crate::layout::{self, Anchor, Layout, Table};
 use crate::merge::{self, ChunkKind, Merge};
 use crate::tree::{Comparison, Status};
 
@@ -408,73 +408,189 @@ pub extern "C" fn dt_merge_chunk_text(diff: &DtFileDiff, index: usize, version: 
     }
 }
 
-pub struct DtFluid(Fluid);
+pub struct DtLayout(Layout);
+
+pub const DT_TABLE_ROWS: u8 = 16;
+pub const DT_TABLE_UNIFIED: u8 = 17;
+
+fn table_of(table: u8) -> Table {
+    match table {
+        DT_TABLE_ROWS => Table::Rows,
+        DT_TABLE_UNIFIED => Table::Unified,
+        side => Table::Lines(side as usize),
+    }
+}
+
+#[repr(C)]
+pub struct DtScrollAnchor {
+    pub index: usize,
+    pub fraction: f64,
+    pub screen_y: f64,
+    pub valid: bool,
+}
 
 /// # Safety
-/// `row_tops` must point to `dt_file_diff_row_count(diff) + 1` values, and `line_tops` to
-/// `dt_file_diff_side_count(diff)` pointers, each to `dt_file_diff_line_count(diff, side) + 1`
-/// values; or either may be null for none.
+/// `diff` must be a diff or null. `line_heights` must point to `dt_file_diff_side_count(diff)`
+/// pointers, each to `dt_file_diff_line_count(diff, side)` values, or be null for none.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dt_fluid_new(
-    diff: &DtFileDiff,
-    row_tops: *const f64,
-    line_tops: *const *const f64,
+pub unsafe extern "C" fn dt_layout_new(
+    diff: *const DtFileDiff,
+    line_heights: *const *const f64,
     padding: f64,
     line_height: f64,
-) -> *mut DtFluid {
-    let sides = dt_file_diff_side_count(diff);
-    let slice = |ptr: *const f64, len: usize| -> &[f64] {
-        if ptr.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(ptr, len) } }
+) -> *mut DtLayout {
+    let Some(diff) = (unsafe { diff.as_ref() }) else {
+        let layout = Layout::new(&[], 0, |_, _| None, 0, |_| None, Vec::new(), padding, line_height);
+        return Box::into_raw(Box::new(DtLayout(layout)));
     };
-    let rows = slice(row_tops, diff.0.row_count() + 1);
-    let lines: Vec<&[f64]> = (0..sides)
+    let sides = dt_file_diff_side_count(diff);
+    let heights: Vec<&[f64]> = (0..sides)
         .map(|side| {
-            let ptr = if line_tops.is_null() { ptr::null() } else { unsafe { *line_tops.add(side) } };
-            slice(ptr, dt_file_diff_line_count(diff, side as u8) + 1)
+            let ptr = if line_heights.is_null() { ptr::null() } else { unsafe { *line_heights.add(side) } };
+            let len = dt_file_diff_line_count(diff, side as u8);
+            if ptr.is_null() { &[] } else { unsafe { std::slice::from_raw_parts(ptr, len) } }
         })
         .collect();
-    let hunks: Vec<fluid::Hunk> = (0..diff.0.hunk_count())
+    let hunks = (0..diff.0.hunk_count())
         .map(|i| {
             let h = diff.0.hunk(i);
-            fluid::Hunk {
+            layout::Hunk {
                 rows: h.row_start as usize..h.row_end as usize,
+                unified: h.unified_start as usize..h.unified_end as usize,
                 lines: (0..sides).map(|s| h.start[s] as usize..h.end[s] as usize).collect(),
             }
         })
         .collect();
-    Box::into_raw(Box::new(DtFluid(Fluid::new(&hunks, rows, &lines, padding, line_height))))
+    let row_line = |row: usize, side: usize| usize::try_from(diff.0.row_line(row, side as u8)).ok();
+    // A unified row shows side A's line, or else side B's.
+    let unified_line = |row: usize| {
+        (0..sides as u8).find_map(|side| {
+            let line = dt_file_diff_unified_line(diff, row, side);
+            usize::try_from(line).ok().map(|line| (side as usize, line))
+        })
+    };
+    let unified = dt_file_diff_unified_count(diff);
+    let layout =
+        Layout::new(&heights, diff.0.row_count(), row_line, unified, unified_line, hunks, padding, line_height);
+    Box::into_raw(Box::new(DtLayout(layout)))
 }
 
 /// # Safety
-/// `fluid` must come from `dt_fluid_new` and not be used afterwards, or be null.
+/// `layout` must come from `dt_layout_new` and not be used afterwards, or be null.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn dt_fluid_free(fluid: *mut DtFluid) {
-    if !fluid.is_null() {
-        drop(unsafe { Box::from_raw(fluid) });
+pub unsafe extern "C" fn dt_layout_free(layout: *mut DtLayout) {
+    if !layout.is_null() {
+        drop(unsafe { Box::from_raw(layout) });
     }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn dt_fluid_top(fluid: &DtFluid, side: u8, y: f64, height: f64) -> f64 {
-    fluid.0.top(side as usize, y, height)
+pub extern "C" fn dt_layout_y(layout: &DtLayout, table: u8, index: usize) -> f64 {
+    layout.0.y(table_of(table), index)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn dt_fluid_scroll(fluid: &mut DtFluid, side: u8, delta: f64, pointer: f64, y: f64, height: f64) -> f64 {
-    fluid.0.scroll(side as usize, delta, pointer, y, height)
+pub extern "C" fn dt_layout_index_at(layout: &DtLayout, table: u8, y: f64) -> isize {
+    layout.0.index_at(table_of(table), y)
+}
+
+/// # Safety
+/// `first` and `last` must be valid to write to.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dt_layout_range(
+    layout: &DtLayout,
+    table: u8,
+    top: f64,
+    bottom: f64,
+    first: *mut usize,
+    last: *mut usize,
+) {
+    let range = layout.0.range(table_of(table), top, bottom);
+    unsafe {
+        *first = range.start;
+        *last = range.end;
+    }
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn dt_fluid_scrolled(fluid: &mut DtFluid, y: f64, height: f64) {
-    fluid.0.scrolled(y, height)
+pub extern "C" fn dt_layout_bottom(layout: &DtLayout, table: u8) -> f64 {
+    layout.0.bottom(table_of(table))
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn dt_fluid_gliding(fluid: &DtFluid) -> bool {
-    fluid.0.gliding()
+pub extern "C" fn dt_layout_hunk_at(layout: &DtLayout, table: u8, index: usize) -> isize {
+    layout.0.hunk_at(table_of(table), index).map_or(-1, |h| h as isize)
 }
 
 #[unsafe(no_mangle)]
-pub extern "C" fn dt_fluid_glide(fluid: &mut DtFluid, elapsed: f64) -> bool {
-    fluid.0.glide(elapsed)
+pub extern "C" fn dt_layout_anchor(
+    layout: &DtLayout,
+    table: u8,
+    current_hunk: isize,
+    top: f64,
+    height: f64,
+) -> DtScrollAnchor {
+    let current = usize::try_from(current_hunk).ok();
+    match layout.0.anchor(table_of(table), current, top, height) {
+        Some(a) => DtScrollAnchor { index: a.index, fraction: a.fraction, screen_y: a.screen_y, valid: true },
+        None => DtScrollAnchor { index: 0, fraction: 0.0, screen_y: 0.0, valid: false },
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_layout_anchor_top(layout: &DtLayout, table: u8, anchor: DtScrollAnchor) -> f64 {
+    let anchor = Anchor { index: anchor.index, fraction: anchor.fraction, screen_y: anchor.screen_y };
+    layout.0.anchor_top(table_of(table), anchor)
+}
+
+/// # Safety
+/// `y` must be valid to write to.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn dt_layout_scroll_to_hunk(
+    layout: &DtLayout,
+    table: u8,
+    hunk: usize,
+    top: f64,
+    height: f64,
+    y: *mut f64,
+) -> bool {
+    match layout.0.scroll_to_hunk(table_of(table), hunk, top, height) {
+        Some(to) => {
+            unsafe { *y = to };
+            true
+        }
+        None => false,
+    }
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_layout_fluid_top(layout: &DtLayout, side: u8, y: f64, height: f64) -> f64 {
+    layout.0.fluid.top(side as usize, y, height)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_layout_fluid_scroll(
+    layout: &mut DtLayout,
+    side: u8,
+    delta: f64,
+    pointer: f64,
+    y: f64,
+    height: f64,
+) -> f64 {
+    layout.0.fluid.scroll(side as usize, delta, pointer, y, height)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_layout_fluid_scrolled(layout: &mut DtLayout, y: f64, height: f64) {
+    layout.0.fluid.scrolled(y, height)
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_layout_fluid_gliding(layout: &DtLayout) -> bool {
+    layout.0.fluid.gliding()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_layout_fluid_glide(layout: &mut DtLayout, elapsed: f64) -> bool {
+    layout.0.fluid.glide(elapsed)
 }
