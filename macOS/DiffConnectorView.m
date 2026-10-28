@@ -33,43 +33,62 @@
 		return;
 	}
 
-	/* Join each hunk on the side before to the same hunk on the side after. */
+	/* Join each hunk on the side before to the same hunk on the side after: all their bands, then their edges over them. */
 	DtFileDiff* diff = owner.diff;
 	size_t count = diff ? dt_file_diff_hunk_count(diff) : 0;
 	NSUInteger next = _side + 1;
 	CGFloat offset = [owner verticalOffset:_side] + [owner shift:_side];
 	CGFloat nextOffset = [owner verticalOffset:next] + [owner shift:next];
 	CGFloat width = NSWidth(self.bounds);
-	for (size_t i = 0; i < count; i++) {
-		DtHunk hunk = dt_file_diff_hunk(diff, i);
-		uint32_t start, end, nextStart, nextEnd;
-		[owner hunk:hunk side:_side start:&start end:&end];
-		[owner hunk:hunk side:next start:&nextStart end:&nextEnd];
-		CGFloat top = [owner lineY:start side:_side] - offset;
-		CGFloat bottom = [owner lineY:end side:_side] - offset;
-		CGFloat nextTop = [owner lineY:nextStart side:next] - nextOffset;
-		CGFloat nextBottom = [owner lineY:nextEnd side:next] - nextOffset;
-		if (fmax(bottom, nextBottom) < NSMinY(dirty) - 1 || fmin(top, nextTop) > NSMaxY(dirty) + 1) continue;
+	for (int pass = 0; pass < 2; pass++) {
+		for (size_t i = 0; i < count; i++) {
+			DtHunk hunk = dt_file_diff_hunk(diff, i);
+			uint32_t start, end, nextStart, nextEnd;
+			[owner hunk:hunk side:_side start:&start end:&end];
+			[owner hunk:hunk side:next start:&nextStart end:&nextEnd];
+			CGFloat top = [owner lineY:start side:_side] - offset;
+			CGFloat bottom = [owner lineY:end side:_side] - offset;
+			CGFloat nextTop = [owner lineY:nextStart side:next] - nextOffset;
+			CGFloat nextBottom = [owner lineY:nextEnd side:next] - nextOffset;
+			if (fmax(bottom, nextBottom) < NSMinY(dirty) - 1 || fmin(top, nextTop) > NSMaxY(dirty) + 1) continue;
+			uint8_t kind = hunk.kind;
 
-		uint8_t kind = hunk.kind;
-		NSBezierPath* band = [NSBezierPath bezierPath];
-		[band moveToPoint:NSMakePoint(0, top)];
-		[band lineToPoint:NSMakePoint(width, nextTop)];
-		[band lineToPoint:NSMakePoint(width, nextBottom)];
-		[band lineToPoint:NSMakePoint(0, bottom)];
-		[band closePath];
-		[line_color(kind, (NSInteger)i == owner.currentHunk) setFill];
-		[band fill];
+			if (pass == 0) {
+				NSBezierPath* band = [NSBezierPath bezierPath];
+				[band moveToPoint:NSMakePoint(0, top)];
+				[band lineToPoint:NSMakePoint(width, nextTop)];
+				[band lineToPoint:NSMakePoint(width, nextBottom)];
+				[band lineToPoint:NSMakePoint(0, bottom)];
+				[band closePath];
+				[line_color(kind, (NSInteger)i == owner.currentHunk) setFill];
+				[band fill];
+				continue;
+			}
 
-		/* Edges along the hunks' outlines: the top's first pixel row, the bottom's last. */
-		NSBezierPath* edges = [NSBezierPath bezierPath];
-		edges.lineWidth = 1;
-		[edges moveToPoint:NSMakePoint(0, top + 0.5)];
-		[edges lineToPoint:NSMakePoint(width, nextTop + 0.5)];
-		[edges moveToPoint:NSMakePoint(0, fmax(top, bottom - 1) + 0.5)];
-		[edges lineToPoint:NSMakePoint(width, fmax(nextTop, nextBottom - 1) + 0.5)];
-		[g_edge_colors[kind] setStroke];
-		[edges stroke];
+			/*
+			 * Edges along the hunks' outlines: the top's first pixel row, the bottom's
+			 * last. Where the hunk before ends on both sides, its bottom edge is this
+			 * one's top.
+			 */
+			BOOL touching = NO;
+			if (i > 0) {
+				DtHunk previous = dt_file_diff_hunk(diff, i - 1);
+				uint32_t previousStart, previousEnd, previousNextStart, previousNextEnd;
+				[owner hunk:previous side:_side start:&previousStart end:&previousEnd];
+				[owner hunk:previous side:next start:&previousNextStart end:&previousNextEnd];
+				touching = previousEnd == start && previousNextEnd == nextStart;
+			}
+			NSBezierPath* edges = [NSBezierPath bezierPath];
+			edges.lineWidth = 1;
+			if (!touching) {
+				[edges moveToPoint:NSMakePoint(0, top + 0.5)];
+				[edges lineToPoint:NSMakePoint(width, nextTop + 0.5)];
+			}
+			[edges moveToPoint:NSMakePoint(0, fmax(top, bottom - 1) + 0.5)];
+			[edges lineToPoint:NSMakePoint(width, fmax(nextTop, nextBottom - 1) + 0.5)];
+			[g_edge_colors[kind] setStroke];
+			[edges stroke];
+		}
 	}
 }
 
