@@ -11,9 +11,10 @@ use crate::fluid::Phase;
 use crate::layout::{self, Anchor, Layout, Table};
 use crate::merge::{self, ChunkKind, Merge};
 use crate::merge_result::MergeResult;
-use crate::tree::{Comparison, Status};
+use crate::tree::{Comparison, Item, Status};
 
-pub struct DtComparison(Comparison);
+/// A comparison, and its listing.
+pub struct DtComparison(Comparison, Vec<Item>);
 
 /// A diff of two files, or a merge of three.
 pub struct DtFileDiff(Diff);
@@ -219,7 +220,9 @@ unsafe fn path_from_c(path: *const c_char) -> PathBuf {
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn dt_comparison_new(path_a: *const c_char, path_b: *const c_char) -> *mut DtComparison {
     let (a, b) = unsafe { (path_from_c(path_a), path_from_c(path_b)) };
-    Box::into_raw(Box::new(DtComparison(Comparison::new(&a, &b))))
+    let cmp = Comparison::new(&a, &b);
+    let items = cmp.listing();
+    Box::into_raw(Box::new(DtComparison(cmp, items)))
 }
 
 /// # Safety
@@ -251,6 +254,25 @@ pub extern "C" fn dt_comparison_entry(cmp: &DtComparison, index: usize) -> DtEnt
             status: e.status as u8,
         },
         None => DtEntry { path: DtStr::empty(), dir: DtStr::empty(), name: DtStr::empty(), status: Status::Same as u8 },
+    }
+}
+
+#[repr(C)]
+pub struct DtItem {
+    pub title: DtStr,
+    pub entry: isize,
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_comparison_item_count(cmp: &DtComparison) -> usize {
+    cmp.1.len()
+}
+
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_comparison_item(cmp: &DtComparison, index: usize) -> DtItem {
+    match cmp.1.get(index) {
+        Some(item) => DtItem { title: DtStr::new(&item.title), entry: item.entry.map_or(-1, |e| e as isize) },
+        None => DtItem { title: DtStr::empty(), entry: -1 },
     }
 }
 
@@ -347,6 +369,32 @@ pub extern "C" fn dt_file_diff_unified_line(diff: &DtFileDiff, row: usize, side:
         Diff::Merge(..) => None,
     };
     line.map_or(-1, |l| l as i32)
+}
+
+/// The run of a unified view's changed lines a row is in, as `side * 8 + kind`, or -1 for none.
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_file_diff_unified_group(diff: &DtFileDiff, row: usize) -> isize {
+    let (a, b) = (dt_file_diff_unified_line(diff, row, 0), dt_file_diff_unified_line(diff, row, 1));
+    let (side, line) = match (a, b) {
+        (a, -1) if a >= 0 => (0, a),
+        (-1, b) if b >= 0 => (1, b),
+        _ => return -1,
+    };
+    let kind = diff.0.side(side).and_then(|s| s.kinds.get(line as usize)).map_or(0, |&k| k as isize);
+    side as isize * 8 + kind
+}
+
+/// The first hunk that doesn't end before a row, in the side-by-side or unified rows, or else
+/// the last, or -1 for none: to keep current when the diff's reloaded.
+#[unsafe(no_mangle)]
+pub extern "C" fn dt_file_diff_nearest_hunk(diff: &DtFileDiff, unified: bool, row: usize) -> isize {
+    let count = diff.0.hunk_count();
+    (0..count)
+        .find(|&i| {
+            let h = diff.0.hunk(i);
+            (if unified { h.unified_end } else { h.row_end }) as usize > row
+        })
+        .map_or(count as isize - 1, |i| i as isize)
 }
 
 #[unsafe(no_mangle)]

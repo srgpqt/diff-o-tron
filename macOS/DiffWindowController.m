@@ -533,31 +533,24 @@ static NSColor* status_color(uint8_t status) {
 	[_items removeAllObjects];
 	DiffDocument* doc = [self diffDocument];
 	DtComparison* cmp = doc.comparison;
-	size_t count = cmp ? dt_comparison_count(cmp) : 0;
-	NSString* lastDir = @"";
+	size_t count = cmp ? dt_comparison_item_count(cmp) : 0;
 	for (size_t i = 0; i < count; i++) {
-		DtEntry entry = dt_comparison_entry(cmp, i);
-		/* Only list unchanged files when comparing two files. */
-		if (entry.status == DT_STATUS_SAME && count > 1) continue;
-
-		NSString* dir = dt_string(entry.dir);
-		if (dir.length > 0 && ![dir isEqualToString:lastDir]) {
-			SidebarItem* group = [[SidebarItem alloc] init];
-			group.isGroup = YES;
-			group.title = [dir stringByReplacingOccurrencesOfString:@"/" withString:@" › "];
-			[_items addObject:group];
-		}
-		lastDir = dir;
-
+		DtItem listed = dt_comparison_item(cmp, i);
 		SidebarItem* item = [[SidebarItem alloc] init];
-		item.title = dt_string(entry.name);
+		item.title = dt_string(listed.title);
+		if (listed.entry < 0) {
+			item.isGroup = YES;
+			[_items addObject:item];
+			continue;
+		}
+		DtEntry entry = dt_comparison_entry(cmp, (size_t)listed.entry);
 		/* Comparing two files: name them by their labels, when they have them. */
-		if (count == 1 && ([doc labelForSide:0] || [doc labelForSide:1])) {
+		if (dt_comparison_count(cmp) == 1 && ([doc labelForSide:0] || [doc labelForSide:1])) {
 			NSString* a = [doc nameForSide:0];
 			NSString* b = [doc nameForSide:1];
 			item.title = [a isEqualToString:b] ? a : [NSString stringWithFormat:@"%@ → %@", a, b];
 		}
-		item.entry = i;
+		item.entry = (size_t)listed.entry;
 		item.path = dt_string(entry.path);
 		item.status = entry.status;
 		[_items addObject:item];

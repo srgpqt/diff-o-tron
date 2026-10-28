@@ -167,6 +167,17 @@ DtEntry dt_comparison_entry(const DtComparison *cmp, size_t index);
 /* The full path of an entry's file on one side, empty if it's absent there. */
 DtStr dt_comparison_entry_path(const DtComparison *cmp, size_t index, uint8_t side);
 
+/*
+ * The comparison's files to list, as a sidebar shows them: those that changed,
+ * or the one compared if it's just two files, each directory's under a heading.
+ */
+typedef struct {
+	DtStr title;    /* the file's name, or the directory's path, its parts separated by " › " */
+	ptrdiff_t entry; /* the file's entry, or -1 for a directory's heading */
+} DtItem;
+size_t dt_comparison_item_count(const DtComparison *cmp);
+DtItem dt_comparison_item(const DtComparison *cmp, size_t index);
+
 /* Diff the files of an entry. Never returns NULL. */
 DtFileDiff *dt_file_diff_new(const DtComparison *cmp, size_t index, DtDiffOptions options);
 /*
@@ -192,6 +203,17 @@ int32_t dt_file_diff_row_line(const DtFileDiff *diff, size_t row, uint8_t side);
  */
 size_t dt_file_diff_unified_count(const DtFileDiff *diff);
 int32_t dt_file_diff_unified_line(const DtFileDiff *diff, size_t row, uint8_t side);
+/*
+ * The run of the unified view's changed lines from the same side and of the
+ * same kind a row is in, as side * 8 + kind (DT_LINE_*), or -1 for an unchanged row.
+ */
+ptrdiff_t dt_file_diff_unified_group(const DtFileDiff *diff, size_t row);
+/*
+ * The first hunk that doesn't end before a row, of the side-by-side or the
+ * unified rows, or else the last, or -1 for none: the hunk to keep current
+ * when a diff is reloaded.
+ */
+ptrdiff_t dt_file_diff_nearest_hunk(const DtFileDiff *diff, bool unified, size_t row);
 size_t dt_file_diff_line_count(const DtFileDiff *diff, uint8_t side);
 DtLine dt_file_diff_line(const DtFileDiff *diff, uint8_t side, size_t index);
 size_t dt_file_diff_hunk_count(const DtFileDiff *diff);

@@ -178,7 +178,7 @@ $(APP)/Contents/Info.plist: macOS/Info.plist Makefile
 	@mkdir -p $(@D)
 	sed -e 's/@APP_VERSION@/$(APP_VERSION)/' -e 's/@APP_BUILD@/$(APP_BUILD)/' -e 's/@MACOS_MIN@/$(MACOS_MIN)/' $< > $@
 
-$(APP)/Contents/Resources/Credits.html: macOS/credits.html
+$(APP)/Contents/Resources/Credits.html: Assets/credits.html
 	@mkdir -p $(@D)
 	cp $< $@
 
@@ -310,7 +310,7 @@ check-credits:
 	@status=0; \
 	for crate in $$($(CARGO) tree -e normal --prefix none --target all | awk '{ print $$1 }' | sort -u); do \
 		[ "$$crate" = diffotron ] && continue; \
-		grep -q "<h3>$$crate</h3>" macOS/credits.html || { echo "macOS/credits.html doesn't credit $$crate"; status=1; }; \
+		grep -q "<h3>$$crate</h3>" Assets/credits.html || { echo "Assets/credits.html doesn't credit $$crate"; status=1; }; \
 	done; \
 	exit $$status
 

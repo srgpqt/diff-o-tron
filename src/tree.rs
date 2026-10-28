@@ -194,6 +194,37 @@ fn same_contents(a: &Path, b: &Path) -> bool {
     }
 }
 
+/// A row of a comparison's listing of its files, as a sidebar shows it: a file, or the heading of
+/// the directory the files after it are in.
+#[derive(Debug, PartialEq)]
+pub struct Item {
+    /// The file's name, or the directory's path, its parts separated by ` › `.
+    pub title: String,
+    /// The file's entry, or `None` for a directory's heading.
+    pub entry: Option<usize>,
+}
+
+impl Comparison {
+    /// The files to list: those that changed, or the one compared if it's just two files, each
+    /// directory's under its heading.
+    pub fn listing(&self) -> Vec<Item> {
+        let mut items = Vec::new();
+        let mut last_dir = "";
+        for (i, entry) in self.entries.iter().enumerate() {
+            if entry.status == Status::Same && self.entries.len() > 1 {
+                continue;
+            }
+            let dir = entry.dir();
+            if !dir.is_empty() && dir != last_dir {
+                items.push(Item { title: dir.replace('/', " › "), entry: None });
+            }
+            last_dir = dir;
+            items.push(Item { title: entry.name().to_string(), entry: Some(i) });
+        }
+        items
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +277,20 @@ mod tests {
         );
         assert_eq!((cmp.entries[4].dir(), cmp.entries[4].name()), ("Lib/x", "y.c"));
         assert_eq!((cmp.entries[0].dir(), cmp.entries[0].name()), ("", "gone.txt"));
+
+        // Listed without the unchanged file, each directory's files under its heading.
+        let item = |title: &str, entry| Item { title: title.into(), entry };
+        assert_eq!(
+            cmp.listing(),
+            [
+                item("gone.txt", Some(0)),
+                item("Docs", None),
+                item("a.md", Some(2)),
+                item("b.md", Some(3)),
+                item("Lib › x", None),
+                item("y.c", Some(4)),
+            ]
+        );
     }
 
     #[test]
@@ -253,6 +298,10 @@ mod tests {
         let t = TempTree::new(&[("a.txt", "1"), ("b.txt", "2")]);
         let cmp = Comparison::new(&t.0.join("a.txt"), &t.0.join("b.txt"));
         assert_eq!(summary(&cmp), [("a.txt → b.txt", Status::Modified)]);
+        // Two files are listed even if they're the same.
+        let same = TempTree::new(&[("a.txt", "1"), ("b.txt", "1")]);
+        let cmp = Comparison::new(&same.0.join("a.txt"), &same.0.join("b.txt"));
+        assert_eq!(cmp.listing(), [Item { title: "a.txt → b.txt".into(), entry: Some(0) }]);
     }
 
     #[test]

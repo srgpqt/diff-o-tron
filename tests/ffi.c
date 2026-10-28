@@ -68,6 +68,10 @@ int main(int argc, char **argv) {
 	CHECK(str_eq(dt_comparison_entry_path(cmp, 0, DT_SIDE_A), path_a));
 	CHECK(str_eq(dt_comparison_entry_path(cmp, 0, DT_SIDE_B), path_b));
 	CHECK(dt_comparison_entry_path(cmp, 0, 7).len == 0);
+	CHECK(dt_comparison_item_count(cmp) == 1);
+	DtItem item = dt_comparison_item(cmp, 0);
+	CHECK(str_eq(item.title, "a.txt → b.txt") && item.entry == 0);
+	CHECK(dt_comparison_item(cmp, 5).entry == -1);
 
 	DtDiffOptions options = { 0, 4 };
 	DtFileDiff *diff = dt_file_diff_new(cmp, 0, options);
@@ -110,6 +114,13 @@ int main(int argc, char **argv) {
 	CHECK(dt_file_diff_unified_line(diff, 2, DT_SIDE_A) == -1 && dt_file_diff_unified_line(diff, 2, DT_SIDE_B) == 1);
 	CHECK(dt_file_diff_unified_line(diff, 3, DT_SIDE_A) == 2 && dt_file_diff_unified_line(diff, 3, DT_SIDE_B) == 2);
 	CHECK(dt_file_diff_unified_line(diff, 99, DT_SIDE_A) == -1);
+	CHECK(dt_file_diff_unified_group(diff, 0) == -1 && dt_file_diff_unified_group(diff, 3) == -1);
+	CHECK(dt_file_diff_unified_group(diff, 1) == DT_SIDE_A * 8 + DT_LINE_CHANGED);
+	CHECK(dt_file_diff_unified_group(diff, 2) == DT_SIDE_B * 8 + DT_LINE_CHANGED);
+	CHECK(dt_file_diff_unified_group(diff, 4) == DT_SIDE_B * 8 + DT_LINE_ADDED);
+	CHECK(dt_file_diff_unified_group(diff, 99) == -1);
+	CHECK(dt_file_diff_nearest_hunk(diff, false, 0) == 0 && dt_file_diff_nearest_hunk(diff, false, 2) == 1);
+	CHECK(dt_file_diff_nearest_hunk(diff, false, 99) == 1 && dt_file_diff_nearest_hunk(diff, true, 4) == 1);
 
 	/* The layout, with lines 10 points tall after 4 of padding, in a view 20 points tall. */
 	double heights[2][64];

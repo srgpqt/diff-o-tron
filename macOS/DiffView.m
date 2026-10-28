@@ -212,10 +212,11 @@ static const NSTimeInterval kScrollToHunkDuration = 0.2;
 	if (diff == _diff) return;
 	DtScrollAnchor anchor = keep ? [self scrollAnchor] : (DtScrollAnchor){0, 0, 0, false};
 	/* Where the current hunk starts, in the current mode's rows, to find the nearest hunk in the new diff. */
+	BOOL unified = _mode == kDiffModeUnified;
 	NSInteger hunkRow = -1;
 	if (keep && _diff && _currentHunk >= 0 && (size_t)_currentHunk < dt_file_diff_hunk_count(_diff)) {
 		DtHunk hunk = dt_file_diff_hunk(_diff, (size_t)_currentHunk);
-		hunkRow = _mode == kDiffModeUnified ? hunk.unified_start : hunk.row_start;
+		hunkRow = unified ? hunk.unified_start : hunk.row_start;
 	}
 
 	dt_file_diff_free(_diff);
@@ -224,18 +225,7 @@ static const NSTimeInterval kScrollToHunkDuration = 0.2;
 	_flashTimer = nil;
 	_flash = 0;
 	_currentHunk = diff && dt_file_diff_hunk_count(diff) > 0 ? 0 : -1;
-	if (hunkRow >= 0 && _currentHunk >= 0) {
-		/* The first hunk that doesn't end before it, or else the last. */
-		size_t count = dt_file_diff_hunk_count(diff);
-		_currentHunk = (NSInteger)count - 1;
-		for (size_t i = 0; i < count; i++) {
-			DtHunk hunk = dt_file_diff_hunk(diff, i);
-			if ((NSInteger)(_mode == kDiffModeUnified ? hunk.unified_end : hunk.row_end) > hunkRow) {
-				_currentHunk = (NSInteger)i;
-				break;
-			}
-		}
-	}
+	if (hunkRow >= 0 && _currentHunk >= 0) _currentHunk = dt_file_diff_nearest_hunk(diff, unified, (size_t)hunkRow);
 	_sideCount = diff ? dt_file_diff_side_count(diff) : kSideCount;
 	[self updateSideViews];
 	_maxLines = 0;
@@ -669,14 +659,7 @@ static const NSTimeInterval kScrollToHunkDuration = 0.2;
 
 /* Which run of changed lines a row is in: a number for its side and kind, or -1 if it's unchanged. */
 - (NSInteger) unifiedGroupOfRow:(size_t)row {
-	if (!_diff || row >= dt_file_diff_unified_count(_diff)) return -1;
-	if (dt_file_diff_unified_line(_diff, row, DT_SIDE_A) >= 0 && dt_file_diff_unified_line(_diff, row, DT_SIDE_B) >= 0) {
-		return -1;
-	}
-	NSUInteger side;
-	size_t line;
-	if (![self unifiedRow:row side:&side line:&line]) return -1;
-	return (NSInteger)(side * 4 + dt_file_diff_line(_diff, (uint8_t)side, line).kind);
+	return _diff ? dt_file_diff_unified_group(_diff, row) : -1;
 }
 
 - (BOOL) unifiedGroupStartsAtRow:(size_t)row {
@@ -688,7 +671,7 @@ static const NSTimeInterval kScrollToHunkDuration = 0.2;
 	for (size_t row = first; row < last; row++) {
 		NSInteger group = [self unifiedGroupOfRow:row];
 		if (group < 0) continue;
-		[g_edge_colors[group % 4] setFill];
+		[g_edge_colors[group % 8] setFill];
 		if ([self unifiedGroupStartsAtRow:row]) {
 			NSRectFill(NSMakeRect(NSMinX(dirty), [self unifiedY:row] - offset, NSWidth(dirty), 1));
 		}
