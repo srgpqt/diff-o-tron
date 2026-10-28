@@ -730,7 +730,9 @@ namespace Diffotron {
 				ssize_t group = _diff.unified_group (row);
 				if (group < 0) continue;
 				var color = colors.edge[group % 8];
-				if (unified_group_starts_at_row (row)) fill (snapshot, color, 0, _layout.y (Dt.TABLE_UNIFIED, row) - offset, width, 1);
+				/* Where a run before ends, its bottom edge is this one's top. */
+				bool touching = row > 0 && _diff.unified_group (row - 1) >= 0;
+				if (unified_group_starts_at_row (row) && !touching) fill (snapshot, color, 0, _layout.y (Dt.TABLE_UNIFIED, row) - offset, width, 1);
 				if (_diff.unified_group (row + 1) != group) {
 					fill (snapshot, color, 0, _layout.y (Dt.TABLE_UNIFIED, row + 1) - offset - 1, width, 1);
 				}

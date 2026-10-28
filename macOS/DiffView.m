@@ -672,7 +672,8 @@ static const NSTimeInterval kScrollToHunkDuration = 0.2;
 		NSInteger group = [self unifiedGroupOfRow:row];
 		if (group < 0) continue;
 		[g_edge_colors[group % 8] setFill];
-		if ([self unifiedGroupStartsAtRow:row]) {
+		/* Where a run before ends, its bottom edge is this one's top. */
+		if ([self unifiedGroupStartsAtRow:row] && (row == 0 || [self unifiedGroupOfRow:row - 1] < 0)) {
 			NSRectFill(NSMakeRect(NSMinX(dirty), [self unifiedY:row] - offset, NSWidth(dirty), 1));
 		}
 		if ([self unifiedGroupOfRow:row + 1] != group) {
