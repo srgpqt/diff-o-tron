@@ -163,7 +163,7 @@ impl FileDiff {
     }
 
     /// Lay out the unified view. Within a hunk, each run of rows that pair changed lines shows
-    /// the run's A lines and then its B lines, and so does each run of unpaired lines.
+    /// the run's A lines and then its B lines.
     fn push_unified(&mut self) {
         let mut unified = Vec::with_capacity(self.rows.len());
         let mut ranges = Vec::with_capacity(self.hunks.len());
@@ -172,7 +172,7 @@ impl FileDiff {
             let (start, end) = (hunk.rows.start as usize, hunk.rows.end as usize);
             unified.extend_from_slice(&self.rows[next..start]);
             let first = unified.len() as u32;
-            for run in self.rows[start..end].chunk_by(|x, y| self.paired(x) == self.paired(y)) {
+            for run in self.rows[start..end].chunk_by(|x, y| self.run_kind(x) == self.run_kind(y)) {
                 unified.extend(run.iter().filter_map(|r| r.a).map(|a| Row { a: Some(a), b: None }));
                 unified.extend(run.iter().filter_map(|r| r.b).map(|b| Row { a: None, b: Some(b) }));
             }
@@ -195,12 +195,12 @@ impl FileDiff {
         let first_row = self.rows.len() as u32;
         let pairing = Pairing::infer(&self.a, a.clone(), &self.b, b.clone());
         pairing.apply(&mut self.a, &mut self.b);
-        self.rows.extend(pairing.rows().into_iter().map(|(a, b)| Row { a, b }));
+        self.rows.extend(pairing.rows(false).into_iter().map(|(a, b)| Row { a, b }));
 
-        // A hunk of the line diff for each run of paired rows and each run of unpaired rows.
+        // A hunk of the line diff for each run of paired rows, of removed lines, and of added lines.
         let (mut row, mut a_next, mut b_next) = (first_row, a.start, b.start);
         let mut hunks = Vec::new();
-        for run in self.rows[first_row as usize..].chunk_by(|x, y| self.paired(x) == self.paired(y)) {
+        for run in self.rows[first_row as usize..].chunk_by(|x, y| self.run_kind(x) == self.run_kind(y)) {
             let a_count = run.iter().filter(|r| r.a.is_some()).count() as u32;
             let b_count = run.iter().filter(|r| r.b.is_some()).count() as u32;
             let len = run.len() as u32;
@@ -216,9 +216,11 @@ impl FileDiff {
         self.hunks.extend(hunks);
     }
 
-    /// Whether a row pairs changed lines.
-    fn paired(&self, row: &Row) -> bool {
-        row.a.is_some_and(|a| self.a.kinds[a as usize] == LineKind::Changed)
+    /// What a hunk's row shows, which a run of them shares: whether it pairs changed lines, and
+    /// which sides it has lines of. A removed line and an added one never share a row.
+    fn run_kind(&self, row: &Row) -> (bool, bool, bool) {
+        let paired = row.a.is_some_and(|a| self.a.kinds[a as usize] == LineKind::Changed);
+        (paired, row.a.is_some(), row.b.is_some())
     }
 }
 
@@ -335,14 +337,19 @@ impl Pairing {
         }
     }
 
-    /// Rows for the hunk: delta gives unpaired lines rows of their own, but runs of them share
-    /// rows instead.
-    pub(crate) fn rows(&self) -> Vec<(Option<u32>, Option<u32>)> {
+    /// Rows for the hunk. Between pairs, the unpaired lines of side A come first, then those of
+    /// side B. They get rows of their own, or with `share_unpaired`, runs of them share rows.
+    pub(crate) fn rows(&self, share_unpaired: bool) -> Vec<(Option<u32>, Option<u32>)> {
         let mut rows = Vec::with_capacity(self.alignment.len());
         let (mut minus, mut plus) = (Vec::new(), Vec::new());
         let flush = |rows: &mut Vec<(Option<u32>, Option<u32>)>, minus: &mut Vec<u32>, plus: &mut Vec<u32>| {
-            for i in 0..minus.len().max(plus.len()) {
-                rows.push((minus.get(i).copied(), plus.get(i).copied()));
+            if share_unpaired {
+                for i in 0..minus.len().max(plus.len()) {
+                    rows.push((minus.get(i).copied(), plus.get(i).copied()));
+                }
+            } else {
+                rows.extend(minus.iter().map(|&m| (Some(m), None)));
+                rows.extend(plus.iter().map(|&p| (None, Some(p))));
             }
             minus.clear();
             plus.clear();
@@ -454,11 +461,18 @@ mod tests {
     }
 
     #[test]
-    fn unpaired_lines_share_rows() {
+    fn removed_and_added_lines_are_separate_hunks() {
         let d = diff("x\naaaa\n", "x\nzzzz\nyyyy\n");
-        assert_eq!(rows(&d), [(Some(0), Some(0)), (Some(1), Some(1)), (None, Some(2))]);
+        assert_eq!(rows(&d), [(Some(0), Some(0)), (Some(1), None), (None, Some(1)), (None, Some(2))]);
         assert_eq!(d.a.kinds[1], LineKind::Removed);
         assert_eq!(d.b.kinds[1], LineKind::Added);
+        assert_eq!(
+            d.hunks,
+            [
+                Hunk { rows: 1..2, a: 1..2, b: 1..1, unified: 1..2 },
+                Hunk { rows: 2..4, a: 2..2, b: 1..3, unified: 2..4 }
+            ]
+        );
     }
 
     fn unified(d: &FileDiff) -> Vec<(Option<u32>, Option<u32>)> {
@@ -469,10 +483,17 @@ mod tests {
     fn unified_shows_runs_of_a_lines_then_b_lines() {
         let d =
             diff("same\nlet a = 1;\nlet b = 2;\ngone gone gone\nend\n", "same\nlet a = 10;\nlet b = 20;\nadded\nend\n");
-        // Two changed lines paired, then a removed line and an added one sharing a row.
+        // Two changed lines paired, then a removed line and an added one, each in a row of its own.
         assert_eq!(
             rows(&d),
-            [(Some(0), Some(0)), (Some(1), Some(1)), (Some(2), Some(2)), (Some(3), Some(3)), (Some(4), Some(4))]
+            [
+                (Some(0), Some(0)),
+                (Some(1), Some(1)),
+                (Some(2), Some(2)),
+                (Some(3), None),
+                (None, Some(3)),
+                (Some(4), Some(4))
+            ]
         );
         assert_eq!(d.a.kinds[3], LineKind::Removed);
         assert_eq!(
@@ -488,7 +509,7 @@ mod tests {
                 (Some(4), Some(4)),
             ]
         );
-        assert_eq!(d.hunks.iter().map(|h| h.unified.clone()).collect::<Vec<_>>(), [1..5, 5..7]);
+        assert_eq!(d.hunks.iter().map(|h| h.unified.clone()).collect::<Vec<_>>(), [1..5, 5..6, 6..7]);
     }
 
     #[test]

@@ -163,7 +163,7 @@ impl Merge {
                 let [base_side, a_side, b_side] = &mut self.sides;
                 let changed_side = if changed == A { a_side } else { b_side };
                 pairing.apply(base_side, changed_side);
-                for (base_line, changed_line) in pairing.rows() {
+                for (base_line, changed_line) in pairing.rows(true) {
                     let mut row = [None; 3];
                     row[BASE] = base_line;
                     row[changed] = changed_line;
@@ -178,7 +178,7 @@ impl Merge {
                 pairing.apply(base_side, a_side);
                 b_pairing.apply_to(b_side, false, LineKind::Added);
                 // B's lines are A's.
-                for (base_line, a_line) in pairing.rows() {
+                for (base_line, a_line) in pairing.rows(true) {
                     self.rows.push([base_line, a_line, a_line.map(|l| b.start + (l - a.start))]);
                 }
             }
