@@ -282,6 +282,7 @@ namespace Diffotron {
 			merge.append ("Reset Change", "win.reset-change");
 			menu.append_submenu ("Merge", merge);
 			var app = new Menu ();
+			app.append ("Diff-o-tron Website", "app.website");
 			app.append ("About Diff-o-tron", "app.about");
 			menu.append_section (null, app);
 			return menu;

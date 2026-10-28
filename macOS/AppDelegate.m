@@ -6,6 +6,8 @@
 static DiffDocumentController* g_document_controller = NULL;
 static AppDelegate* g_app_delegate = NULL;
 
+static NSString* const kWebsite = @"https://github.com/srgpqt/diff-o-tron";
+
 #define _(t,a,k) [[NSMenuItem alloc] initWithTitle:t action:a keyEquivalent:k]
 
 static NSMenuItem* with_modifiers(NSMenuItem* item, NSEventModifierFlags modifiers) {
@@ -149,6 +151,7 @@ static void build_main_menu(NSApplication* app) {
 		NSMenu* helpMenu = add_menu(mainMenu, @"Help");
 		[app setHelpMenu:helpMenu];
 		[helpMenu addItem:_(@"Diff-o-tron Help", @selector(showHelp:), @"?")];
+		[helpMenu addItem:_(@"Diff-o-tron Website", @selector(openWebsite:), @"")];
 	}
 }
 
@@ -247,6 +250,11 @@ static NSArray<NSString*>* fixed_width_families(void) {
 		options[NSAboutPanelOptionCredits] = credits;
 	}
 	[NSApp orderFrontStandardAboutPanelWithOptions:options];
+}
+
+/* Help › Diff-o-tron Website, in the default browser. */
+- (IBAction) openWebsite:(id)sender {
+	[[NSWorkspace sharedWorkspace] openURL:[NSURL URLWithString:kWebsite]];
 }
 
 - (BOOL) applicationSupportsSecureRestorableState:(NSApplication*)application {

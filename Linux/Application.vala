@@ -2,6 +2,8 @@ namespace Diffotron {
 	[CCode (cname = "APP_VERSION")]
 	extern const string APP_VERSION;
 
+	const string WEBSITE = "https://github.com/srgpqt/diff-o-tron";
+
 	const string USAGE = """usage: diff-o-tron [-L | --label LABEL]... [PATH_A PATH_B]
        diff-o-tron -o | --output MERGED [-L | --label LABEL]... BASE FILE_A FILE_B
 
@@ -45,6 +47,7 @@ windows are closed. To use it with git difftool and git mergetool:
 			add_action_named ("open", () => open_dialog.begin (false));
 			add_action_named ("open-folders", () => open_dialog.begin (true));
 			add_action_named ("font", () => choose_font.begin ());
+			add_action_named ("website", open_website);
 			add_action_named ("about", show_about);
 			add_action_named ("quit", () => {
 				foreach (var window in get_windows ()) window.close ();
@@ -194,6 +197,11 @@ windows are closed. To use it with git difftool and git mergetool:
 			} catch (Error e) {
 				/* Cancelled. */
 			}
+		}
+
+		/* The app's website, in the default browser. */
+		void open_website () {
+			new Gtk.UriLauncher (WEBSITE).launch.begin (active_window, null);
 		}
 
 		/* The About dialog, with the credits the licenses of the software built in require. */
