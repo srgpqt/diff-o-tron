@@ -587,6 +587,11 @@ pub extern "C" fn dt_layout_fluid_scrolled(layout: &mut DtLayout, y: f64, height
 }
 
 #[unsafe(no_mangle)]
+pub extern "C" fn dt_layout_fluid_line_up(layout: &mut DtLayout) {
+    layout.0.fluid.line_up()
+}
+
+#[unsafe(no_mangle)]
 pub extern "C" fn dt_layout_fluid_gliding(layout: &DtLayout) -> bool {
     layout.0.fluid.gliding()
 }

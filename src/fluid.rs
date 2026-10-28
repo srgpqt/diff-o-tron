@@ -229,6 +229,12 @@ impl Fluid {
         }
     }
 
+    /// Line the sides up with the shared layout at once, without gliding, as when it jumps.
+    pub fn line_up(&mut self) {
+        self.leader = None;
+        self.glide.fill(0.0);
+    }
+
     pub fn gliding(&self) -> bool {
         self.glide.iter().any(|&gap| gap != 0.0)
     }
@@ -320,6 +326,17 @@ mod tests {
         assert!((f.top(1, y + 100.0, HEIGHT) - shown).abs() < 1e-9);
         while f.glide(1.0 / 60.0) {}
         assert_eq!(f.top(1, y + 100.0, HEIGHT), f.lined_up_top(1, y + 100.0, HEIGHT));
+    }
+
+    #[test]
+    fn lining_up_at_once() {
+        let mut f = added_block();
+        let y = f.scroll(0, 600.0, 100.0, 0.0, HEIGHT);
+        f.lead(None, y, HEIGHT);
+        assert!(f.gliding());
+        f.line_up();
+        assert!(f.leader.is_none() && !f.gliding());
+        assert_eq!(f.top(1, 2000.0, HEIGHT), f.lined_up_top(1, 2000.0, HEIGHT));
     }
 
     #[test]

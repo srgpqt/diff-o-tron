@@ -320,6 +320,8 @@ double dt_layout_fluid_scroll(DtLayout *layout, uint8_t side, double delta, doub
  * dt_layout_fluid_scroll scrolled it there, the sides line up with it again.
  */
 void dt_layout_fluid_scrolled(DtLayout *layout, double y, double height);
+/* Line the sides up with the shared layout at once, without gliding, as before it jumps. */
+void dt_layout_fluid_line_up(DtLayout *layout);
 bool dt_layout_fluid_gliding(const DtLayout *layout);
 /* Glide for elapsed seconds. Returns whether the sides are still gliding. */
 bool dt_layout_fluid_glide(DtLayout *layout, double elapsed);

@@ -1,5 +1,7 @@
 #import "DiffView+Private.h"
 
+#import <QuartzCore/QuartzCore.h>
+
 #import "DiffConnectorView.h"
 #import "DiffGutterView.h"
 #import "DiffPaneView.h"
@@ -60,6 +62,8 @@ NSColor* line_color(uint8_t kind, BOOL inCurrentHunk) {
 
 
 static const NSTimeInterval kFlashDuration = 0.4;
+/* How long scrolling to a change within a view takes. */
+static const NSTimeInterval kScrollToHunkDuration = 0.2;
 
 @implementation DiffView {
 	NSArray<NSScrollView*>* _scrolls;
@@ -795,9 +799,25 @@ static const NSTimeInterval kFlashDuration = 0.4;
 	DiffPaneView* pane = _panes[0];
 	NSRect visible = pane.visibleRect;
 	double y = 0;
-	if (dt_layout_scroll_to_hunk(_layout, [self modeTable], (size_t)_currentHunk, NSMinY(visible), NSHeight(visible), &y)) {
-		[pane scrollPoint:NSMakePoint(NSMinX(visible), y)];
-	}
+	if (!dt_layout_scroll_to_hunk(_layout, [self modeTable], (size_t)_currentHunk, NSMinY(visible), NSHeight(visible), &y)) return;
+	/* Smoothly within a view, or else at once, with the sides lined up at once. */
+	BOOL near = fabs(y - NSMinY(visible)) <= NSHeight(visible);
+	if (!near) dt_layout_fluid_line_up(_layout);
+
+	NSScrollView* scroll = _scrolls[0];
+	NSClipView* clip = scroll.contentView;
+	NSRect bounds = clip.bounds;
+	bounds.origin.y = y;
+	/* No further than the document scrolls. */
+	NSPoint origin = [clip constrainBoundsRect:bounds].origin;
+	/* Animated either way, so that this takes over from any scrolling still going. */
+	[NSAnimationContext runAnimationGroup:^(NSAnimationContext* context) {
+		context.duration = near ? kScrollToHunkDuration : 0;
+		context.timingFunction = [CAMediaTimingFunction functionWithName:kCAMediaTimingFunctionEaseInEaseOut];
+		[clip.animator setBoundsOrigin:origin];
+	} completionHandler:nil];
+	[scroll reflectScrolledClipView:clip];
+	[self redrawAll];
 }
 
 @end

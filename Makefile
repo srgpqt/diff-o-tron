@@ -168,7 +168,7 @@ $(BUILD)/macOS/%.o: macOS/%.m
 
 $(MACOS_BIN): $(MACOS_APP_OBJECTS) $(RUST_LIB)
 	@mkdir -p $(@D)
-	$(MACOS_CC) $(MACOS_FLAGS) $(MACOS_LDFLAGS) -o $@ $^ -framework Cocoa -framework CoreServices -framework CoreText $(RUST_LIBS_macos)
+	$(MACOS_CC) $(MACOS_FLAGS) $(MACOS_LDFLAGS) -o $@ $^ -framework Cocoa -framework CoreServices -framework CoreText -framework QuartzCore $(RUST_LIBS_macos)
 
 $(MACOS_CLI): $(BUILD)/macOS/cli.o
 	@mkdir -p $(@D)
