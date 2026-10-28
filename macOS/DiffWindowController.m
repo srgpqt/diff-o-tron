@@ -135,6 +135,11 @@ static NSColor* status_color(uint8_t status) {
 		window.tabbingIdentifier = kComparisonType;
 		window.minSize = NSMakeSize(640, 400);
 		[self buildViews];
+		[[NSNotificationCenter defaultCenter]
+			addObserver:self
+			selector:@selector(fontFamilyDidChange:)
+			name:kFontFamilyDidChangeNotification
+			object:nil];
 	}
 	return self;
 }
@@ -212,6 +217,7 @@ static NSColor* status_color(uint8_t status) {
 	NSInteger mode = [defaults objectForKey:kDiffModeDefault] ? [defaults integerForKey:kDiffModeDefault] : kDiffModeFluid;
 	_diffView.mode = mode >= kDiffModeBlocks && mode <= kDiffModeUnified ? mode : kDiffModeFluid;
 	_diffView.wrapsLines = [defaults objectForKey:kWrapLinesDefault] ? [defaults boolForKey:kWrapLinesDefault] : YES;
+	_diffView.fontFamily = [defaults stringForKey:kFontFamilyDefault];
 	CGFloat textSize = [defaults objectForKey:kTextSizeDefault] ? (CGFloat)[defaults doubleForKey:kTextSizeDefault] : kDefaultFontSize;
 	if (textSize >= kMinTextSize && textSize <= kMaxTextSize) _diffView.fontSize = textSize;
 
@@ -1092,9 +1098,15 @@ static NSColor* status_color(uint8_t status) {
 	[_mergeText sizeToFit];
 }
 
+/* View › Font chose another font, for every window. */
+- (void) fontFamilyDidChange:(NSNotification*)notification {
+	_diffView.fontFamily = [[NSUserDefaults standardUserDefaults] stringForKey:kFontFamilyDefault];
+	[self updateMergeFont];
+}
+
 /* The merged result in the diff's font, with its tab stops. */
 - (void) updateMergeFont {
-	NSFont* font = [NSFont monospacedSystemFontOfSize:_diffView.fontSize weight:NSFontWeightRegular];
+	NSFont* font = text_font(_diffView.fontFamily, _diffView.fontSize);
 	NSMutableParagraphStyle* paragraph = [[NSMutableParagraphStyle alloc] init];
 	paragraph.tabStops = @[];
 	paragraph.defaultTabInterval = [@"0" sizeWithAttributes:@{NSFontAttributeName: font}].width * kTabWidth;

@@ -30,3 +30,11 @@ void clip_to_bounds(NSView* view);
 void add_subviews(NSView* parent, NSArray<NSView*>* views);
 
 BOOL is_directory(NSURL* url);
+
+/* User defaults: the font family of the comparisons' text, or none for the system's monospaced font. */
+static NSString* const kFontFamilyDefault = @"FontFamily";
+/* Posted to the default notification center when the font family default changes. */
+static NSString* const kFontFamilyDidChangeNotification = @"DiffotronFontFamilyDidChange";
+
+/* The comparisons' font: a font family's regular face, or the system's monospaced font for nil or a family not installed. */
+NSFont* text_font(NSString* family, CGFloat size);

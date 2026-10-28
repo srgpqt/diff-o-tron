@@ -1,5 +1,6 @@
 #import "AppDelegate.h"
 
+#import "Common.h"
 #import "DiffDocumentController.h"
 
 static DiffDocumentController* g_document_controller = NULL;
@@ -111,6 +112,12 @@ static void build_main_menu(NSApplication* app) {
 		[viewMenu addItem:[NSMenuItem separatorItem]];
 		[viewMenu addItem:_(@"Increase Text Size", @selector(increaseTextSize:), @"+")];
 		[viewMenu addItem:_(@"Decrease Text Size", @selector(decreaseTextSize:), @"-")];
+		NSMenuItem* fontItem = _(@"Font", NULL, @"");
+		NSMenu* fontMenu = [[NSMenu alloc] initWithTitle:@"Font"];
+		/* Filled in as it opens. */
+		fontMenu.delegate = (id<NSMenuDelegate>)app.delegate;
+		fontItem.submenu = fontMenu;
+		[viewMenu addItem:fontItem];
 		[viewMenu addItem:[NSMenuItem separatorItem]];
 		[viewMenu addItem:with_modifiers(_(@"Wrap Lines", @selector(toggleWrapLines:), @"k"), shiftCommand)];
 		[viewMenu addItem:with_modifiers(_(@"Ignore Whitespace", @selector(toggleIgnoreWhitespace:), @"'"), shiftCommand)];
@@ -172,6 +179,59 @@ static void build_main_menu(NSApplication* app) {
 
 - (BOOL) applicationOpenUntitledFile:(NSApplication*)sender {
 	[g_document_controller newDocument:nil];
+	return YES;
+}
+
+/*
+ * The installed font families of fixed-width fonts, for View › Font: the layout
+ * counts columns, so proportional fonts would break it.
+ */
+static NSArray<NSString*>* fixed_width_families(void) {
+	NSMutableSet<NSString*>* families = [NSMutableSet set];
+	for (NSString* name in [[NSFontManager sharedFontManager] availableFontNamesWithTraits:NSFixedPitchFontMask]) {
+		NSString* family = [NSFont fontWithName:name size:12].familyName;
+		/* The system's own fonts, which start with a dot, aren't for choosing. */
+		if (family && ![family hasPrefix:@"."]) [families addObject:family];
+	}
+	return [families.allObjects sortedArrayUsingSelector:@selector(localizedCaseInsensitiveCompare:)];
+}
+
+/* View › Font: the system's monospaced font, then the fixed-width font families, each in its font. */
+- (void) menuNeedsUpdate:(NSMenu*)menu {
+	if (menu.numberOfItems > 0) return;
+	NSMenuItem* system = _(@"System Monospaced", @selector(chooseFontFamily:), @"");
+	system.target = self;
+	[menu addItem:system];
+	[menu addItem:[NSMenuItem separatorItem]];
+	CGFloat size = [NSFont systemFontSize];
+	for (NSString* family in fixed_width_families()) {
+		NSMenuItem* item = _(family, @selector(chooseFontFamily:), @"");
+		item.target = self;
+		item.representedObject = family;
+		item.attributedTitle = [[NSAttributedString alloc] initWithString:family attributes:@{NSFontAttributeName: text_font(family, size)}];
+		[menu addItem:item];
+	}
+}
+
+/* Use a font family, or the system's monospaced font, in every comparison window, and from now on. */
+- (IBAction) chooseFontFamily:(NSMenuItem*)sender {
+	NSString* family = sender.representedObject;
+	NSUserDefaults* defaults = [NSUserDefaults standardUserDefaults];
+	if (family) {
+		[defaults setObject:family forKey:kFontFamilyDefault];
+	} else {
+		[defaults removeObjectForKey:kFontFamilyDefault];
+	}
+	[[NSNotificationCenter defaultCenter] postNotificationName:kFontFamilyDidChangeNotification object:nil];
+}
+
+- (BOOL) validateMenuItem:(NSMenuItem*)menuItem {
+	if (menuItem.action == @selector(chooseFontFamily:)) {
+		NSString* current = [[NSUserDefaults standardUserDefaults] stringForKey:kFontFamilyDefault];
+		NSString* family = menuItem.representedObject;
+		BOOL chosen = family ? [family isEqualToString:current] : current.length == 0;
+		menuItem.state = chosen ? NSControlStateValueOn : NSControlStateValueOff;
+	}
 	return YES;
 }
 

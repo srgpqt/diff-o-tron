@@ -32,3 +32,9 @@ BOOL is_directory(NSURL* url) {
 	[url getResourceValue:&directory forKey:NSURLIsDirectoryKey error:NULL];
 	return directory.boolValue;
 }
+
+NSFont* text_font(NSString* family, CGFloat size) {
+	/* Weight 5 is regular. */
+	NSFont* font = family.length > 0 ? [[NSFontManager sharedFontManager] fontWithFamily:family traits:0 weight:5 size:size] : nil;
+	return font ? font : [NSFont monospacedSystemFontOfSize:size weight:NSFontWeightRegular];
+}

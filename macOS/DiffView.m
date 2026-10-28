@@ -252,7 +252,7 @@ static const NSTimeInterval kFlashDuration = 0.4;
 
 - (void) setFontSize:(CGFloat)fontSize {
 	_fontSize = fontSize;
-	_font = [NSFont monospacedSystemFontOfSize:fontSize weight:NSFontWeightRegular];
+	_font = text_font(_fontFamily, fontSize);
 	NSLayoutManager* layoutManager = [[NSLayoutManager alloc] init];
 	_fontLineHeight = [layoutManager defaultLineHeightForFont:_font];
 	_lineHeight = ceil(_fontLineHeight * 1.3);
@@ -280,6 +280,11 @@ static const NSTimeInterval kFlashDuration = 0.4;
 
 	[self updateGutterWidth];
 	[self relayoutLines];
+}
+
+- (void) setFontFamily:(NSString*)fontFamily {
+	_fontFamily = [fontFamily copy];
+	self.fontSize = _fontSize;
 }
 
 - (void) updateGutterWidth {

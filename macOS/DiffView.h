@@ -32,6 +32,8 @@ static const CGFloat kDefaultFontSize = 11;
 	/* The files shown, for their context menus: an NSURL per side, or NSNull for none. */
 	@property (nonatomic, copy) NSArray* fileURLs;
 	@property (nonatomic) CGFloat fontSize;
+	/* The text's font family, or nil for the system's monospaced font: see text_font. */
+	@property (nonatomic, copy) NSString* fontFamily;
 	/* Index of the highlighted hunk, or -1. */
 	@property (nonatomic) NSInteger currentHunk;
 	/* Called when a click changes currentHunk. */
