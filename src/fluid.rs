@@ -14,6 +14,10 @@ use std::ops::Range;
 const MIN_MARGIN_LINES: f64 = 3.0;
 const MAX_RATIO: f64 = 3.0;
 
+/// Where a side's speed changes, at the ends of a run widened, it changes over up to this many
+/// lines either side.
+const CORNER_LINES: f64 = 4.0;
+
 /// Sides lining up anew glide into line, closing the gap at this rate, in seconds, at no more
 /// than this speed in points a second.
 const GLIDE_TIME: f64 = 0.1;
@@ -31,33 +35,88 @@ pub struct Hunk {
 }
 
 /// A map from the shared layout to a side's own, through points where they meet, in order of
-/// both, and one to one before the first and after the last.
+/// both, and one to one before the first and after the last. Between the points it's straight,
+/// but for its corners, rounded so that a side's speed changes smoothly, not all at once.
 #[derive(Debug, Default)]
-struct Map(Vec<(f64, f64)>);
-
-impl Map {
-    fn side(&self, shared: f64) -> f64 {
-        interpolate(&self.0, shared, |&(shared, side)| (shared, side))
-    }
-
-    fn shared(&self, side: f64) -> f64 {
-        interpolate(&self.0, side, |&(shared, side)| (side, shared))
-    }
+struct Map {
+    points: Vec<(f64, f64)>,
+    /// How far the curve rounding the corner at each point reaches either side of it, in the
+    /// shared layout: none at the first and last, so that the sides start and end together.
+    corners: Vec<f64>,
 }
 
-/// The y for x along the line through `points`, as `key` gives their (x, y).
-fn interpolate(points: &[(f64, f64)], x: f64, key: impl Fn(&(f64, f64)) -> (f64, f64)) -> f64 {
-    let Some(first) = points.first() else { return x };
-    let i = points.partition_point(|p| key(p).0 <= x);
-    if i == 0 {
-        let (x0, y0) = key(first);
-        return y0 + (x - x0);
+impl Map {
+    fn new(start: (f64, f64)) -> Map {
+        Map { points: vec![start], corners: Vec::new() }
     }
-    let (x0, y0) = key(&points[i - 1]);
-    match points.get(i).map(&key) {
-        Some((x1, y1)) if x1 > x0 => y0 + (x - x0) * (y1 - y0) / (x1 - x0),
-        Some(_) => y0,
-        None => y0 + (x - x0),
+
+    /// Round the corners, by up to `reach` either side of each, and no further than halfway to
+    /// the points either side, so that the curves don't meet. Every map with points at the same
+    /// shared positions gets them at the same places.
+    fn round_corners(&mut self, reach: f64) {
+        let p = &self.points;
+        self.corners = (0..p.len())
+            .map(|i| match (i.checked_sub(1).map(|j| p[j].0), p.get(i + 1).map(|q| q.0)) {
+                (Some(before), Some(after)) => reach.min((p[i].0 - before) / 2.0).min((after - p[i].0) / 2.0).max(0.0),
+                _ => 0.0,
+            })
+            .collect();
+    }
+
+    /// The slope of the straight part between points i and i + 1, or one beyond them.
+    fn slope(&self, i: Option<usize>) -> f64 {
+        match i.and_then(|i| Some((self.points[i], *self.points.get(i + 1)?))) {
+            Some(((x0, y0), (x1, y1))) if x1 > x0 => (y1 - y0) / (x1 - x0),
+            _ => 1.0,
+        }
+    }
+
+    fn side(&self, shared: f64) -> f64 {
+        let p = &self.points;
+        let Some(&first) = p.first() else { return shared };
+        let i = p.partition_point(|&(x, _)| x <= shared);
+        // On the curve rounding the corner at a point next to it: its slope changes evenly
+        // from the straight part's before to the one's after.
+        for j in [i.checked_sub(1), Some(i)].into_iter().flatten() {
+            let reach = self.corners.get(j).copied().unwrap_or(0.0);
+            let Some(&(x, y)) = p.get(j) else { continue };
+            if reach > 0.0 && (shared - x).abs() < reach {
+                let (before, after) = (self.slope(j.checked_sub(1)), self.slope(Some(j)));
+                let d = shared - (x - reach);
+                return y - before * reach + before * d + (after - before) * d * d / (4.0 * reach);
+            }
+        }
+        if i == 0 {
+            return first.1 + (shared - first.0);
+        }
+        let (x0, y0) = p[i - 1];
+        y0 + (shared - x0) * self.slope(Some(i - 1))
+    }
+
+    /// The inverse of `side`.
+    fn shared(&self, side: f64) -> f64 {
+        let p = &self.points;
+        let (Some(&first), Some(&last)) = (p.first(), p.last()) else { return side };
+        // Between the corners' curves around the points either side, where side() is on either side of it.
+        let i = p.partition_point(|&(_, y)| y <= side);
+        let reach = |j: usize| self.corners.get(j).copied().unwrap_or(0.0);
+        let mut low = match i {
+            0 => first.0 - (first.1 - side).max(0.0) - 1.0,
+            _ => p[i - 1].0 - reach(i - 1),
+        };
+        let mut high = match p.get(i) {
+            Some(&(x, _)) => x + reach(i),
+            None => last.0 + (side - last.1).max(0.0) + 1.0,
+        };
+        for _ in 0..60 {
+            let middle = (low + high) / 2.0;
+            if self.side(middle) < side {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        (low + high) / 2.0
     }
 }
 
@@ -109,7 +168,7 @@ impl Fluid {
         // at the end, with the unchanged lines between one to one. Widened, a side with few or
         // no lines in a run still moves across it as the others do, and none has to jump.
         let row_end = rows.len().saturating_sub(1);
-        let mut maps: Vec<Map> = lines.iter().map(|tops| Map(vec![(at(rows, 0), at(tops, 0))])).collect();
+        let mut maps: Vec<Map> = lines.iter().map(|tops| Map::new((at(rows, 0), at(tops, 0)))).collect();
         for (i, run) in runs.iter().enumerate() {
             let (top, bottom) = (at(rows, run.rows.start), at(rows, run.rows.end));
             // As far as the unchanged lines go: to the start or end, or halfway to the next run.
@@ -130,12 +189,13 @@ impl Fluid {
             let above = margin.min(room_above).max(0.0);
             let below = margin.min(room_below).max(0.0);
             for ((map, tops), r) in maps.iter_mut().zip(lines).zip(&run.lines) {
-                map.0.push((top - above, at(tops, r.start) - above));
-                map.0.push((bottom + below, at(tops, r.end) + below));
+                map.points.push((top - above, at(tops, r.start) - above));
+                map.points.push((bottom + below, at(tops, r.end) + below));
             }
         }
         for (map, tops) in maps.iter_mut().zip(lines) {
-            map.0.push((at(rows, row_end), at(tops, tops.len().saturating_sub(1))));
+            map.points.push((at(rows, row_end), at(tops, tops.len().saturating_sub(1))));
+            map.round_corners(CORNER_LINES * line_height);
         }
 
         Fluid {
@@ -273,11 +333,36 @@ mod tests {
     fn maps_widen_runs_into_the_unchanged_lines() {
         let f = added_block();
         // Widened by 400 points either side, the run is 800 points tall on side A and 2400 on B.
-        assert_eq!(f.maps[0].0, [(4.0, 4.0), (404.0, 404.0), (2804.0, 1204.0), (3204.0, 1604.0)]);
-        assert_eq!(f.maps[1].0, [(4.0, 4.0), (404.0, 404.0), (2804.0, 2804.0), (3204.0, 3204.0)]);
+        assert_eq!(f.maps[0].points, [(4.0, 4.0), (404.0, 404.0), (2804.0, 1204.0), (3204.0, 1604.0)]);
+        assert_eq!(f.maps[1].points, [(4.0, 4.0), (404.0, 404.0), (2804.0, 2804.0), (3204.0, 3204.0)]);
         assert_eq!(f.maps[0].side(1604.0), 804.0);
-        assert_eq!(f.maps[0].shared(804.0), 1604.0);
+        assert!((f.maps[0].shared(804.0) - 1604.0).abs() < 1e-6);
         assert_eq!(f.maps[0].side(4000.0), 2400.0);
+        // The ends meet exactly.
+        assert_eq!(f.maps[0].side(4.0), 4.0);
+        assert_eq!(f.maps[0].side(3204.0), 1604.0);
+    }
+
+    #[test]
+    fn corners_are_rounded() {
+        let f = added_block();
+        let map = &f.maps[0];
+        // Rounded over 64 points either side of 404, where side A slows from 1 to 1/3.
+        assert_eq!(map.corners, [0.0, 64.0, 64.0, 0.0]);
+        assert_eq!(map.side(340.0), 340.0);
+        assert!((map.side(468.0) - (404.0 + 64.0 / 3.0)).abs() < 1e-9);
+        // The speed changes evenly, without a step anywhere.
+        let speed = |x: f64| map.side(x + 0.01) - map.side(x);
+        let mut last = speed(0.0);
+        for step in 1..3300 {
+            let now = speed(step as f64);
+            assert!((now - last).abs() < 0.01 * 0.02, "speed stepped at {step}");
+            last = now;
+        }
+        // And it maps back.
+        for x in [100.0, 350.0, 404.0, 420.0, 1000.0, 2790.0, 2804.0, 3300.0] {
+            assert!((map.shared(map.side(x)) - x).abs() < 1e-6, "{x}");
+        }
     }
 
     #[test]
